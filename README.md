@@ -9,3 +9,13 @@ tg chat: https://t.me/community_starvell
 
 
 Нашли баги? Пиши в чат https://t.me/community_starvell
+
+
+
+⚙️ Автобамп 
+• 🛒 Заказы/возвраты 
+• 📩 SMS 
+• 🧩 Плагины
+👨‍💻 Dev: t.me/exfador
+📢 @starvellapi 
+💬 @community_starvell
