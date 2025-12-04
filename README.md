@@ -1,39 +1,50 @@
+# Starvell Bot
 
-tg chat: https://t.me/community_starvell
-
-
-Как установить бота? 
-1. Скачай питон: https://www.python.org/downloads/release/python-3110/, не забудь add to patch при установке
-2. Далее запусти start_bot.bat, введи данные из @botfather, session (из куки едитора выбери с сайта starvell и введи) и пароль
-3. Далее бот запустится, введи пароль и выбери язык
+- **Разработчик**: [@exfador](https://t.me/exfador)
+- **Канал**: [@starvellapi](https://t.me/starvellapi)
+- **Чат сообщества**: [@community_starvell](https://t.me/community_starvell)
+- **Сообщить о багах/проблемах**: Пишите в [чат сообщества](https://t.me/community_starvell)
 
 
-Нашли баги? Пиши в чат https://t.me/community_starvell
+## Возможности
+- ⚙️ Автобамп
+- 🛒 Управление заказами и возвратами
+- 📩 SMS
+- 🧩 Плагины
+- 👋 Приветствие
+- 📊 Статистика
 
+## Установка на Windows
 
+1. **Установите Python**
+   - Скачайте Python 3.11.0: [https://www.python.org/downloads/release/python-3110/](https://www.python.org/downloads/release/python-3110/)
+   - **Важно**: во время установки отметьте опцию "Add Python to PATH"
 
-⚙️ Автобамп 
-• 🛒 Заказы/возвраты 
-• 📩 SMS 
-• 🧩 Плагины
-👨‍💻 Dev: t.me/exfador
-📢 @starvellapi 
-💬 @community_starvell
+2. **Запустите бота**
+   - Запустите файл `start_bot.bat`
+   - Введите данные, полученные от [@BotFather](https://t.me/botfather)
+   - Введите session (cookie-данные из редактора cookie для сайта starvell)
+   - Введите пароль
+   - После запуска бота введите пароль и выберите язык
 
+## Установка на Linux (Ubuntu/Debian)
 
+Выполните следующие команды:
 
-Как установить на linux (ubuntu)?
----------------------------
-Выполните команду:
-sudo apt-get install
-Выполните команду:
-sudo apt-get install language-pack-gnome-ru
-Выполните команду:
-sudo apt-get install language-pack-kde-ru
-Выполните команду:
-exit
-Подключитесь к серверу.
-Выполните команду:
-sudo update-locale LANG=ru_RU.utf8 (если варнинг/еррор) пишем эту же команду и снова exit и заходим заново
-Далее вводим wget -O setup_starvell.sh https://raw.githubusercontent.com/exfador/starvell_api/refs/heads/main/setup_starvell.sh && chmod +x setup_starvell.sh && sudo ./setup_starvell.sh
+```bash
+# Обновление локали
+sudo apt-get update
+sudo apt-get install -y language-pack-gnome-ru language-pack-kde-ru
+sudo update-locale LANG=ru_RU.utf8
+
+# Если появляется предупреждение/ошибка:
+# 1. Выполните команду снова: sudo update-locale LANG=ru_RU.utf8
+# 2. Выйдите: exit
+# 3. Переподключитесь к серверу
+
+# Установка Starvell
+wget -O setup_starvell.sh https://raw.githubusercontent.com/exfador/starvell_api/refs/heads/main/setup_starvell.sh
+chmod +x setup_starvell.sh
+sudo ./setup_starvell.sh
+
 
