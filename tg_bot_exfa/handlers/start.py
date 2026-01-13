@@ -4,6 +4,7 @@ import logging
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import hashlib
 
 import tg_bot_exfa.app as app
@@ -58,10 +59,12 @@ async def cmd_restart(message: Message):
     from pathlib import Path
 
     db = app.app_context.db
+    cfg = app.app_context.config
     user = await db.get_user(message.from_user.id)
     if not user.get("authorized"):
         return
-    m = await message.answer("Перезапуск…")
+    lang = user.get("language") or cfg.default_language
+    m = await message.answer(tr.t(lang, "restart_start"))
 
     async def do_exec_restart():
         await asyncio.sleep(1)
@@ -71,7 +74,7 @@ async def cmd_restart(message: Message):
 
     asyncio.create_task(do_exec_restart())
     try:
-        await m.edit_text("Готово. Идёт полный перезапуск…")
+        await m.edit_text(tr.t(lang, "restart_done"))
     except Exception:
         pass
 
@@ -148,4 +151,97 @@ async def on_change_password(message: Message, state: FSMContext):
         reply_markup=kb.settings_menu(lambda k: tr.t(lang, k)).as_markup(),
     )
     log.info(f"password_changed user_id={message.from_user.id}")
+
+
+@router.message(Command("update"))
+async def cmd_update(message: Message):
+    import requests
+    from version import VERSION
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(message.from_user.id)
+    if not user.get("authorized"):
+        return
+    lang = user.get("language") or cfg.default_language
+    latest = None
+    try:
+        r = requests.get(
+            "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
+            headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            for it in (r.json() or []):
+                name = str((it or {}).get("name") or "").strip()
+                if name and name.lower() != "api":
+                    latest = name
+                    break
+    except Exception:
+        latest = None
+    lines = [tr.t(lang, "update_title"), tr.t(lang, "update_current", current=VERSION)]
+    markup = None
+    if latest and latest != VERSION:
+        lines.append(tr.t(lang, "update_available", latest=latest))
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=tr.t(lang, "btn_update"), callback_data=f"update:install:{latest}")]])
+    else:
+        lines.append(tr.t(lang, "update_none"))
+    await message.answer("\n".join(lines), reply_markup=markup)
+
+
+@router.message(Command("logs"))
+async def cmd_logs(message: Message):
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+    from aiogram.types import FSInputFile
+
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(message.from_user.id)
+    if not user.get("authorized"):
+        return
+
+    root = Path(__file__).resolve().parents[2]
+    logs_dir = root / "logs"
+
+    if not logs_dir.exists():
+        await message.answer("📂 Папка логов не найдена")
+        return
+
+    has_files = False
+    for _ in logs_dir.rglob("*"):
+        has_files = True
+        break
+    if not has_files:
+        await message.answer("📂 Папка логов пуста")
+        return
+
+    status_msg = await message.answer("📦 Собираю архив логов…")
+
+    try:
+        tmp_dir = Path(tempfile.gettempdir())
+        base_name = tmp_dir / f"logs_{int(time.time())}"
+        archive_path = shutil.make_archive(str(base_name), "zip", root_dir=str(logs_dir))
+
+        doc = FSInputFile(archive_path, filename=os.path.basename(archive_path))
+        await message.answer_document(doc, caption="📦 Архив логов")
+    except Exception as e:
+        try:
+            await status_msg.edit_text(f"❌ Не удалось создать архив логов: {e}")
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            if "archive_path" in locals() and os.path.exists(archive_path):
+                os.remove(archive_path)
+        except Exception:
+            pass
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
 

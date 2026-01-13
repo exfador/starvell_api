@@ -44,6 +44,14 @@ class Database:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS chat_last_user_message (
+                    chat_id TEXT PRIMARY KEY,
+                    last_at INTEGER DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS templates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     content TEXT NOT NULL,
@@ -72,6 +80,16 @@ class Database:
                 """
                 CREATE TABLE IF NOT EXISTS digest_sent (
                     key TEXT PRIMARY KEY,
+                    created_at INTEGER DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autodelivery_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product TEXT NOT NULL,
+                    value TEXT NOT NULL,
                     created_at INTEGER DEFAULT 0
                 )
                 """
@@ -188,6 +206,29 @@ class Database:
                 )
                 await db.commit()
 
+    async def get_chat_last_user_message_at(self, chat_id: str) -> int | None:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                cur = await db.execute("SELECT last_at FROM chat_last_user_message WHERE chat_id=?", (chat_id,))
+                row = await cur.fetchone()
+                await cur.close()
+                if not row:
+                    return None
+                try:
+                    return int(row[0])
+                except Exception:
+                    return None
+
+    async def set_chat_last_user_message_at(self, chat_id: str, ts: int) -> None:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                await db.execute(
+                    "INSERT INTO chat_last_user_message(chat_id, last_at) VALUES(?, ?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET last_at=excluded.last_at",
+                    (chat_id, ts),
+                )
+                await db.commit()
+
     async def add_template(self, content: str) -> int:
         async with self._lock:
             async with aiosqlite.connect(self.path) as db:
@@ -292,5 +333,63 @@ class Database:
                     (key, created_at),
                 )
                 await db.commit()
+
+    async def add_autodelivery_items(self, product: str, values: list[str]) -> int:
+        if not values:
+            return 0
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                created_at = int(time.time())
+                await db.executemany(
+                    "INSERT INTO autodelivery_items(product, value, created_at) VALUES(?, ?, ?)",
+                    [(product, v, created_at) for v in values],
+                )
+                await db.commit()
+                return len(values)
+
+    async def pop_autodelivery_item(self, product: str) -> str | None:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT id, value FROM autodelivery_items WHERE product=? ORDER BY id ASC LIMIT 1",
+                    (product,),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if not row:
+                    return None
+                item_id = int(row["id"]) if "id" in row.keys() else int(row[0])
+                value = str(row["value"]) if "value" in row.keys() else str(row[1])
+                await db.execute("DELETE FROM autodelivery_items WHERE id=?", (item_id,))
+                await db.commit()
+                return value
+
+    async def count_autodelivery(self, product: str) -> int:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                cur = await db.execute("SELECT COUNT(*) FROM autodelivery_items WHERE product=?", (product,))
+                row = await cur.fetchone()
+                await cur.close()
+                return int(row[0]) if row else 0
+
+    async def list_autodelivery_products(self) -> list[tuple[str, int]]:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                cur = await db.execute("SELECT product, COUNT(*) AS cnt FROM autodelivery_items GROUP BY product ORDER BY product ASC")
+                rows = await cur.fetchall()
+                await cur.close()
+                return [(str(r[0]), int(r[1])) for r in rows]
+
+    async def delete_autodelivery_product(self, product: str) -> int:
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
+                cur = await db.execute("SELECT COUNT(*) FROM autodelivery_items WHERE product=?", (product,))
+                row = await cur.fetchone()
+                to_del = int(row[0]) if row else 0
+                await cur.close()
+                await db.execute("DELETE FROM autodelivery_items WHERE product=?", (product,))
+                await db.commit()
+                return to_del
 
 

@@ -11,13 +11,17 @@ class Keyboards:
 
     def main_menu(self, t) -> InlineKeyboardBuilder:
         b = InlineKeyboardBuilder()
+        b.button(text=t("btn_info"), callback_data="menu:info")
         b.button(text=t("btn_language"), callback_data="menu:lang")
         b.button(text=t("btn_notifications"), callback_data="menu:notifications")
+        b.button(text=t("btn_welcome"), callback_data="menu:welcome")
         b.button(text=t("btn_templates"), callback_data="menu:templates")
+        b.button(text=t("btn_autodelivery"), callback_data="menu:ad")
         b.button(text=t("btn_settings"), callback_data="menu:settings")
+        b.button(text=t("btn_prefix"), callback_data="menu:prefix")
         b.button(text=t("btn_plugins"), callback_data="menu:plugins")
         b.button(text=t("btn_stats"), callback_data="menu:stats")
-        b.adjust(1, 2, 3)
+        b.adjust(2, 2, 2, 2, 2)
         return b
 
     def notifications(
@@ -43,6 +47,55 @@ class Keyboards:
         b.adjust(2, 2, 1)
         return b
 
+    def prefix_menu(self, t, enabled: bool) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_prefix_disable") if enabled else t("btn_prefix_enable"), callback_data="prefix:toggle")
+        b.button(text=t("btn_prefix_change"), callback_data="prefix:change")
+        b.button(text=t("btn_back"), callback_data="back:main")
+        b.adjust(1, 1, 1)
+        return b
+
+    def ad_menu(self, t) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_ad_list"), callback_data="ad:list")
+        b.button(text=t("btn_ad_add"), callback_data="ad:add")
+        b.button(text=t("btn_back"), callback_data="back:main")
+        b.adjust(2, 1)
+        return b
+
+    def ad_add(self, t) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_cancel"), callback_data="ad:cancel")
+        return b
+
+    def ad_list(self, t, items: list[tuple[str, str]]) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        for item_id, label in items:
+            b.button(text=label, callback_data=f"ad:item:{item_id}")
+        b.button(text=t("btn_back"), callback_data="menu:ad")
+        b.adjust(1)
+        return b
+
+    def ad_item(self, t, item_id: str) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_ad_add"), callback_data=f"ad:item_add:{item_id}")
+        b.button(text=t("btn_ad_delete"), callback_data=f"ad:del_confirm:{item_id}")
+        b.button(text=t("btn_back"), callback_data="ad:list")
+        b.adjust(1, 2)
+        return b
+
+    def ad_delete_confirm(self, t, item_id: str) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_yes"), callback_data=f"ad:del_yes:{item_id}")
+        b.button(text=t("btn_no"), callback_data=f"ad:item:{item_id}")
+        b.adjust(2)
+        return b
+
+    def ad_add_to_item(self, t, item_id: str) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_cancel"), callback_data=f"ad:item:{item_id}")
+        return b
+
     def language_with_back(self, t) -> InlineKeyboardBuilder:
         b = InlineKeyboardBuilder()
         b.button(text=t("lang_ru"), callback_data="lang:ru")
@@ -55,13 +108,31 @@ class Keyboards:
         b = InlineKeyboardBuilder()
         b.button(text=t("btn_change_session"), callback_data="settings:change_session")
         b.button(text=t("btn_change_password"), callback_data="settings:change_password")
+        b.button(text=t("btn_change_token"), callback_data="settings:change_token")
         b.button(text=t("btn_back"), callback_data="back:main")
-        b.adjust(1, 2)
+        b.adjust(1, 2, 1)
+        return b
+
+    def welcome_menu(self, t, enabled: bool) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(
+            text=t("btn_welcome_toggle_off") if enabled else t("btn_welcome_toggle_on"),
+            callback_data="welcome:toggle",
+        )
+        b.button(text=t("btn_welcome_change_text"), callback_data="welcome:change_text")
+        b.button(text=t("btn_welcome_change_cooldown"), callback_data="welcome:change_cooldown")
+        b.button(text=t("btn_back"), callback_data="back:main")
+        b.adjust(1, 1, 1, 1)
         return b
 
     def cancel(self, t) -> InlineKeyboardBuilder:
         b = InlineKeyboardBuilder()
         b.button(text=t("btn_cancel"), callback_data="settings:cancel")
+        return b
+
+    def cancel_custom(self, t, callback_data: str) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        b.button(text=t("btn_cancel"), callback_data=callback_data)
         return b
 
     def templates_menu(self, t) -> InlineKeyboardBuilder:
@@ -122,9 +193,22 @@ class Keyboards:
 
     def plugins_menu(self, t) -> InlineKeyboardBuilder:
         b = InlineKeyboardBuilder()
-        b.button(text=t("btn_order_plugin"), url="https://t.me/exfador")
+        b.button(text=t("btn_plugins_add"), callback_data="plugins:add")
+        b.button(text=t("btn_plugins_list"), callback_data="plugins:list")
         b.button(text=t("btn_back"), callback_data="back:main")
-        b.adjust(1, 1)
+        b.adjust(2, 1)
+        return b
+
+    def info_links(self, t, author_url: str | None, channel_url: str | None, chat_url: str | None) -> InlineKeyboardBuilder:
+        b = InlineKeyboardBuilder()
+        if author_url:
+            b.button(text=t("btn_author"), url=author_url)
+        if channel_url:
+            b.button(text=t("btn_channel"), url=channel_url)
+        if chat_url:
+            b.button(text=t("btn_chat"), url=chat_url)
+        b.button(text=t("btn_back"), callback_data="back:main")
+        b.adjust(2, 2)
         return b
 
 

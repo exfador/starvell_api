@@ -6,6 +6,8 @@ from typing import Optional
 
 import aiohttp
 
+from api.rate_limiter import throttle
+
 
 _cached_build_id: Optional[str] = None
 _cached_at: float = 0.0
@@ -42,6 +44,7 @@ async def _fetch_build_id(session_cookie: str) -> str:
     }
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
+        await throttle()
         async with session.get("https://starvell.com/") as resp:
             resp.raise_for_status()
             html = await resp.text()

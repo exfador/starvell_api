@@ -204,7 +204,7 @@ async def send_bump_notification(lot: dict, success: bool) -> None:
         await bot.session.close()
 
 
-async def send_chat_notification(username: str, text: str, chat_id: str) -> None:
+async def send_chat_notification(username: str, text: str, chat_id: str, image_url: str | None = None) -> None:
     cfg = load_config()
     if not cfg.token:
         return
@@ -219,12 +219,18 @@ async def send_chat_notification(username: str, text: str, chat_id: str) -> None
             msg = tr.t(lang, "chat_notification", username=safe_username, text=safe_text)
             url = f"https://starvell.com/chat/{chat_id}"
             markup = kb.chat_notification(lambda k: tr.t(lang, k), chat_id, url).as_markup()
-            await bot.send_message(chat_id_, msg, reply_markup=markup)
+            if image_url:
+                try:
+                    await bot.send_photo(chat_id_, image_url, caption=msg, reply_markup=markup)
+                except Exception:
+                    await bot.send_message(chat_id_, f"{msg}\n{html.escape(image_url)}", reply_markup=markup)
+            else:
+                await bot.send_message(chat_id_, msg, reply_markup=markup)
     finally:
         await bot.session.close()
 
 
-async def send_order_notification(order: dict) -> None:
+async def send_order_notification(order: dict, ad: tuple[str, str] | None = None) -> None:
     cfg = load_config()
     if not cfg.token:
         return
@@ -235,7 +241,7 @@ async def send_order_notification(order: dict) -> None:
             return
         order_id = order.get("id")
         qty = order.get("quantity") or 1
-        total_price = order.get("totalPrice") or order.get("basePrice") or 0
+        total_price = order.get("basePrice") or order.get("totalPrice") or 0
         def _fmt_minor_rub(v) -> str:
             try:
                 iv = int(v)
@@ -251,6 +257,37 @@ async def send_order_notification(order: dict) -> None:
         offer = order.get("offerDetails") or {}
         game = (offer.get("game") or {}).get("name") or "-"
         category = (offer.get("category") or {}).get("name") or "-"
+        sub_category_name = ((offer.get("subCategory") or {}).get("name") or "").strip()
+        attrs = offer.get("attributes") or []
+        attr_values: list[str] = []
+        for attr in attrs:
+            try:
+                value = (attr or {}).get("value") or {}
+                name_ru = str(value.get("nameRu") or value.get("name") or "").strip()
+                if name_ru:
+                    attr_values.append(name_ru)
+            except Exception:
+                continue
+
+        product_parts: list[str] = []
+        if sub_category_name:
+            product_parts.append(sub_category_name)
+        if attr_values:
+            product_parts.append(", ".join(attr_values))
+
+        product = ", ".join(product_parts).strip()
+
+        if not product:
+            offer_obj = (offer.get("offer") or {})
+            des_rus = ((offer.get("descriptions") or {}).get("rus") or {})
+            product = (
+                str(des_rus.get("briefDescription") or "").strip()
+                or str(des_rus.get("description") or "").strip()
+                or str(offer_obj.get("name") or "").strip()
+                or str(offer.get("name") or "").strip()
+                or str(offer.get("title") or "").strip()
+                or "-"
+            )
         url = f"https://starvell.com/order/{order_id}"
         order_text_by_lang: dict[str, str] = {}
         for chat_id_, lang in recipients:
@@ -262,9 +299,14 @@ async def send_order_notification(order: dict) -> None:
                     buyer=buyer,
                     game=game,
                     category=category,
+                    product=product,
                     quantity=qty,
                     total_price=_fmt_minor_rub(total_price),
                 )
+                if ad is not None:
+                    name, value = ad
+                    addon = tr.t(lang, "ad_drop_append", name=name, value=value)
+                    text = f"{text}\n\n{addon}"
                 order_text_by_lang[lang] = text
             msg = order_text_by_lang[lang]
             markup = kb.order_notification(lambda k: tr.t(lang, k), order_id, url).as_markup()
@@ -284,7 +326,7 @@ async def send_order_completed_notification(order: dict) -> None:
             return
         order_id = order.get("id")
         qty = order.get("quantity") or 1
-        total_price = order.get("totalPrice") or order.get("basePrice") or 0
+        total_price = order.get("basePrice") or order.get("totalPrice") or 0
         def _fmt_minor_rub(v) -> str:
             try:
                 iv = int(v)
@@ -312,6 +354,25 @@ async def send_order_completed_notification(order: dict) -> None:
                 quantity=qty,
                 total_price=_fmt_minor_rub(total_price),
             )
+            markup = kb.order_notification_view(lambda k: tr.t(lang, k), order_id, url).as_markup()
+            await bot.send_message(chat_id_, text, reply_markup=markup)
+    finally:
+        await bot.session.close()
+
+
+async def send_autodelivery_item(order: dict, product_name: str, value: str) -> None:
+    cfg = load_config()
+    if not cfg.token:
+        return
+    bot = Bot(token=cfg.token, default=DefaultBotProperties(parse_mode="HTML"))
+    try:
+        recipients = await _recipients("notify_orders")
+        if not recipients:
+            return
+        order_id = order.get("id")
+        url = f"https://starvell.com/order/{order_id}"
+        for chat_id_, lang in recipients:
+            text = tr.t(lang, "ad_drop_text", name=product_name, value=value, order_id=order_id)
             markup = kb.order_notification_view(lambda k: tr.t(lang, k), order_id, url).as_markup()
             await bot.send_message(chat_id_, text, reply_markup=markup)
     finally:
@@ -406,6 +467,25 @@ async def sync_digest_view(payload: dict) -> None:
                         pass
             except Exception:
                 continue
+    finally:
+        await bot.session.close()
+
+
+async def send_update_available(tag_name: str, current_version: str) -> None:
+    cfg = load_config()
+    if not cfg.token:
+        return
+    bot = Bot(token=cfg.token, default=DefaultBotProperties(parse_mode="HTML"))
+    try:
+        recipients = await _recipients_authorized()
+        if not recipients:
+            return
+        for chat_id_, _lang in recipients:
+            text = f"Доступно обновление {tag_name} (текущая {current_version})"
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="Обновить", callback_data=f"update:install:{tag_name}")]]
+            )
+            await bot.send_message(chat_id_, text, reply_markup=markup)
     finally:
         await bot.session.close()
 

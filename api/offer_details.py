@@ -2,9 +2,15 @@ import aiohttp
 from aiohttp import ClientResponseError
 
 from api.next_data import get_build_id, reset_build_id
+from api.rate_limiter import throttle
 
 
-async def fetch_offer_detail(session_cookie: str, offer_id: int, sid_cookie: str | None = None) -> dict:
+async def fetch_offer_detail(
+    session_cookie: str,
+    offer_id: int,
+    sid_cookie: str | None = None,
+    my_games_cookie: str | None = None,
+) -> dict:
     headers = {
         "accept": "*/*",
         "accept-language": "ru,en;q=0.9",
@@ -12,12 +18,9 @@ async def fetch_offer_detail(session_cookie: str, offer_id: int, sid_cookie: str
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 YaBrowser/25.8.0.0 Safari/537.36",
         "x-nextjs-data": "1",
     }
-    cookies = {
-        "session": session_cookie,
-        "starvell.theme": "dark",
-        "starvell.time_zone": "Europe/Moscow",
-        "starvell.my_games": "10,1,11",
-    }
+    cookies = {"session": session_cookie, "starvell.theme": "dark", "starvell.time_zone": "Europe/Moscow"}
+    if my_games_cookie:
+        cookies["starvell.my_games"] = my_games_cookie
     if sid_cookie:
         cookies["sid"] = sid_cookie
     timeout = aiohttp.ClientTimeout(total=20)
@@ -27,6 +30,7 @@ async def fetch_offer_detail(session_cookie: str, offer_id: int, sid_cookie: str
         url = f"https://starvell.com/_next/data/{build_id}/offers/{offer_id}.json?offer_id={offer_id}"
         async with aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
             try:
+                await throttle()
                 async with session.get(url) as resp:
                     resp.raise_for_status()
                     data = await resp.json()

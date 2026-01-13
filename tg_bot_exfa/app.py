@@ -7,6 +7,7 @@ class AppContext:
         self.config = config
         self.db = db
         self.monitor_task = None
+        self.plugin_manager = None
 
 
 app_context: AppContext | None = None
