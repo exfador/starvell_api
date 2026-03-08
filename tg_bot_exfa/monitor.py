@@ -661,6 +661,8 @@ async def _check_chats(
         unread = chat.get("unreadMessageCount", 0)
         last_message = chat.get("lastMessage") or {}
         msg_id = last_message.get("id")
+        if msg_id is not None:
+            msg_id = str(msg_id)
         metadata = last_message.get("metadata") or {}
         if not msg_id or metadata.get("isAuto"):
             continue
@@ -681,6 +683,8 @@ async def _check_chats(
         if not other_username and participants:
             other_username = participants[0].get("username") or ""
         stored = await db.get_last_notified_message(chat_id)
+        if stored is not None:
+            stored = str(stored)
         to_notify: list[dict] = []
         last_msg_author_norm = None
         last_msg_from_self = False
@@ -690,6 +694,12 @@ async def _check_chats(
                     await db.set_last_notified_message(chat_id, msg_id)
                 except Exception:
                     pass
+            if processed_for_chat is not None:
+                processed_for_chat.add(msg_id)
+            continue
+        if msg_id and stored and msg_id == stored:
+            if processed_for_chat is not None:
+                processed_for_chat.add(msg_id)
             continue
         try:
             limit = max(unread, 50) if stored else max(unread, 20)
@@ -701,6 +711,7 @@ async def _check_chats(
                 mid = msg.get("id")
                 if not mid:
                     continue
+                mid = str(mid)
                 if stored and mid == stored:
                     break
                 metadata = msg.get("metadata") or {}
@@ -770,13 +781,15 @@ async def _check_chats(
         if stored is None and not to_notify and (user_id_norm is None or last_author_id_norm != user_id_norm):
             content = (last_message.get("content") or "").strip()
             if content:
-                to_notify = [(msg_id, content)]
+                to_notify = [{"id": msg_id, "text": content}]
         if not to_notify and stored != msg_id and (user_id_norm is None or last_author_id_norm != user_id_norm):
             content = (last_message.get("content") or "").strip()
             if content:
-                to_notify = [(msg_id, content)]
+                to_notify = [{"id": msg_id, "text": content}]
 
         if not to_notify:
+            if processed_for_chat is not None:
+                processed_for_chat.add(msg_id)
             continue
 
         last_user_ts: int | None = None
@@ -787,9 +800,11 @@ async def _check_chats(
                 last_user_ts = None
 
         for item in to_notify:
-            mid = item.get("id")
-            text = item.get("text") or ""
-            image_url = item.get("image_url")
+            mid = item.get("id") if isinstance(item, dict) else None
+            if mid is not None:
+                mid = str(mid)
+            text = (item.get("text") or "") if isinstance(item, dict) else ""
+            image_url = item.get("image_url") if isinstance(item, dict) else None
             if not mid or stored == mid:
                 continue
             snippet = (text or "").strip()
