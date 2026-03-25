@@ -32,17 +32,6 @@
 Выполните следующие команды:
 
 ```bash
-# Обновление локали
-sudo apt-get update
-sudo apt-get install -y language-pack-gnome-ru language-pack-kde-ru
-sudo update-locale LANG=ru_RU.utf8
-
-# Если появляется предупреждение/ошибка:
-# 1. Выполните команду снова: sudo update-locale LANG=ru_RU.utf8
-# 2. Выйдите: exit
-# 3. Переподключитесь к серверу
-
-# Установка Starvell
 wget -O setup_starvell.sh https://raw.githubusercontent.com/exfador/starvell_api/refs/heads/main/setup_starvell.sh
 chmod +x setup_starvell.sh
 sudo ./setup_starvell.sh
