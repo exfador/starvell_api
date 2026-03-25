@@ -8,6 +8,7 @@ async def fetch_chat_messages(
     chat_id: str,
     limit: int = 50,
     my_games_cookie: str | None = None,
+    interlocutor_id: int | None = None,
 ) -> list[dict]:
     headers = {
         "accept": "*/*",
@@ -20,9 +21,27 @@ async def fetch_chat_messages(
     cookies = {"session": session_cookie, "starvell.theme": "dark", "starvell.time_zone": "Europe/Moscow"}
     if my_games_cookie:
         cookies["starvell.my_games"] = my_games_cookie
-    payload = {"chatId": chat_id, "limit": limit}
     timeout = aiohttp.ClientTimeout(total=20)
+
+    if interlocutor_id is not None:
+        url = "https://starvell.com/api/bff/chat-page"
+        payload = {
+            "interlocutorId": int(interlocutor_id),
+            "messagesListDto": {"chatId": chat_id, "limit": limit},
+        }
+        async with aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
+            await throttle()
+            async with session.post(url, json=payload) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                if isinstance(data, dict):
+                    items = (data.get("messagesListResult") or {}).get("items")
+                    if isinstance(items, list):
+                        return items
+                return []
+
     url = "https://starvell.com/api/messages/list"
+    payload = {"chatId": chat_id, "limit": limit}
     async with aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
         await throttle()
         async with session.post(url, json=payload) as resp:
@@ -30,5 +49,8 @@ async def fetch_chat_messages(
             data = await resp.json()
             if isinstance(data, list):
                 return data
+            if isinstance(data, dict):
+                items = (data.get("messagesListResult") or {}).get("items")
+                if isinstance(items, list):
+                    return items
             return []
-

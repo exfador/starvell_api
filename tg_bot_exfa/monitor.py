@@ -671,6 +671,7 @@ async def _check_chats(
             continue
         participants = chat.get("participants") or []
         other_username = ""
+        interlocutor_id: int | None = None
         participants_map: list[tuple[str | None, str]] = []
         for participant in participants:
             participant_id_norm = _normalize_id(participant.get("id"))
@@ -680,6 +681,9 @@ async def _check_chats(
                 continue
             if username_candidate:
                 other_username = username_candidate
+            raw_pid = participant.get("id")
+            if isinstance(raw_pid, int) and interlocutor_id is None:
+                interlocutor_id = raw_pid
         if not other_username and participants:
             other_username = participants[0].get("username") or ""
         stored = await db.get_last_notified_message(chat_id)
@@ -703,7 +707,7 @@ async def _check_chats(
             continue
         try:
             limit = max(unread, 50) if stored else max(unread, 20)
-            messages = await fetch_chat_messages(session_cookie, chat_id, limit=limit)
+            messages = await fetch_chat_messages(session_cookie, chat_id, limit=limit, interlocutor_id=interlocutor_id)
             new_items: list[dict] = []
             for msg in messages:
                 if not isinstance(msg, dict):
@@ -742,26 +746,35 @@ async def _check_chats(
                 if not content_text and not image_url:
                     continue
                 text_for_notify = content_text if content_text else "📷 Фото"
-                new_items.append({"id": mid, "text": text_for_notify, "image_url": image_url})
+                new_items.append({"id": mid, "text": text_for_notify, "image_url": image_url, "author_id": author_id_norm})
             to_notify = list(reversed(new_items))
         except Exception as exc:
             logging.getLogger("exfador.monitor").warning(f"chat_messages_fetch_failed chat_id={chat_id} error={exc}")
-            content = (last_message.get("content") or "").strip()
-            image_url = None
-            try:
-                lm_images = (last_message.get("images") or [])
-                if isinstance(lm_images, list) and lm_images:
-                    for im in lm_images:
-                        if isinstance(im, dict):
-                            image_url = _image_preview_url(im)
-                            if image_url:
-                                break
-            except Exception:
-                image_url = None
-            if content or image_url:
-                to_notify = [{"id": msg_id, "text": content or "📷 Фото", "image_url": image_url}]
-            else:
+            fb_author_id = last_message.get("authorId")
+            if fb_author_id is None:
+                fb_author_data = last_message.get("author") or {}
+                fb_author_id = fb_author_data.get("id")
+            fb_author_norm = _normalize_id(fb_author_id)
+            if fb_author_norm and user_id_norm and fb_author_norm == user_id_norm:
                 to_notify = []
+            else:
+                content = (last_message.get("content") or "").strip()
+                image_url = None
+                try:
+                    lm_images = (last_message.get("images") or [])
+                    if isinstance(lm_images, list) and lm_images:
+                        for im in lm_images:
+                            if isinstance(im, dict):
+                                image_url = _image_preview_url(im)
+                                if image_url:
+                                    break
+                except Exception:
+                    image_url = None
+                if content or image_url:
+                    skip_plugins = fb_author_norm is None
+                    to_notify = [{"id": msg_id, "text": content or "📷 Фото", "image_url": image_url, "author_id": fb_author_norm, "_skip_plugins": skip_plugins}]
+                else:
+                    to_notify = []
         last_author_id = last_message.get("authorId")
         if last_author_id is None:
             last_author_data = last_message.get("author") or {}
@@ -781,11 +794,11 @@ async def _check_chats(
         if stored is None and not to_notify and (user_id_norm is None or last_author_id_norm != user_id_norm):
             content = (last_message.get("content") or "").strip()
             if content:
-                to_notify = [{"id": msg_id, "text": content}]
+                to_notify = [{"id": msg_id, "text": content, "author_id": last_author_id_norm}]
         if not to_notify and stored != msg_id and (user_id_norm is None or last_author_id_norm != user_id_norm):
             content = (last_message.get("content") or "").strip()
             if content:
-                to_notify = [{"id": msg_id, "text": content}]
+                to_notify = [{"id": msg_id, "text": content, "author_id": last_author_id_norm}]
 
         if not to_notify:
             if processed_for_chat is not None:
@@ -834,21 +847,30 @@ async def _check_chats(
                                 f"welcome_send_failed chat_id={chat_id} error={exc_w}"
                             )
 
-                await send_chat_notification(safe_username, safe_text, chat_id, image_url=image_url)
+                try:
+                    await send_chat_notification(safe_username, safe_text, chat_id, image_url=image_url)
+                except Exception as exc_notify:
+                    logging.getLogger("exfador.monitor").warning(
+                        f"chat_notify_failed chat_id={chat_id} msg_id={mid} error={exc_notify}"
+                    )
                 await db.set_last_notified_message(chat_id, mid)
                 if processed_for_chat is not None:
                     processed_for_chat.add(mid)
-                try:
-                    cfg_now_inner = load_config()
-                    ctx = PluginContext(session_cookie=session_cookie, db=db, config=cfg_now_inner)
-                    pm = app.app_context.plugin_manager if app.app_context else None
-                    if pm:
-                        await pm.dispatch_chat_message(safe_text, chat_id, ctx)
-                except Exception:
-                    pass
+                skip_plugins = (item.get("_skip_plugins") if isinstance(item, dict) else False) or False
+                if not skip_plugins:
+                    try:
+                        cfg_now_inner = load_config()
+                        ctx = PluginContext(session_cookie=session_cookie, db=db, config=cfg_now_inner)
+                        ctx.message_author_id = item.get("author_id") if isinstance(item, dict) else None
+                        ctx.user_id = user_id_norm
+                        pm = app.app_context.plugin_manager if app.app_context else None
+                        if pm:
+                            await pm.dispatch_chat_message(safe_text, chat_id, ctx)
+                    except Exception:
+                        pass
             except Exception as exc:
                 logging.getLogger("exfador.monitor").warning(
-                    f"chat_notify_failed chat_id={chat_id} msg_id={mid} error={exc}"
+                    f"chat_message_process_failed chat_id={chat_id} msg_id={mid} error={exc}"
                 )
 
         if welcome_enabled and welcome_cooldown_seconds > 0 and last_user_ts is not None:
