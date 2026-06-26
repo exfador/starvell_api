@@ -80,7 +80,7 @@ def _text_auth(success: bool, lang: str, user: dict | None = None) -> str:
     uid = user.get("id")
     uname = html.escape(str(user.get("username")))
     rating = user.get("rating")
-    holded = user.get("holdedAmount")
+    holded = (user.get("balance") or {}).get("holdedRubBalance")
     balance = (user.get("balance") or {}).get("rubBalance")
     base = tr.t(
         lang,
@@ -241,7 +241,7 @@ async def send_order_notification(order: dict, ad: tuple[str, str] | None = None
             return
         order_id = order.get("id")
         qty = order.get("quantity") or 1
-        total_price = order.get("basePrice") or order.get("totalPrice") or 0
+        total_price = order.get("totalPrice") or order.get("basePrice") or 0
         def _fmt_minor_rub(v) -> str:
             try:
                 iv = int(v)
@@ -252,8 +252,7 @@ async def send_order_notification(order: dict, ad: tuple[str, str] | None = None
                     return f"{fv/100:.2f}"
                 except Exception:
                     return "0.00"
-        user = order.get("user") or {}
-        buyer = user.get("username") or str(user.get("id") or "-")
+        buyer = (order.get("user") or {}).get("username") or str(order.get("buyerId") or "-")
         offer = order.get("offerDetails") or {}
         game = (offer.get("game") or {}).get("name") or "-"
         category = (offer.get("category") or {}).get("name") or "-"
@@ -326,7 +325,7 @@ async def send_order_completed_notification(order: dict) -> None:
             return
         order_id = order.get("id")
         qty = order.get("quantity") or 1
-        total_price = order.get("basePrice") or order.get("totalPrice") or 0
+        total_price = order.get("totalPrice") or order.get("basePrice") or 0
         def _fmt_minor_rub(v) -> str:
             try:
                 iv = int(v)
@@ -337,8 +336,7 @@ async def send_order_completed_notification(order: dict) -> None:
                     return f"{fv/100:.2f}"
                 except Exception:
                     return "0.00"
-        user = order.get("user") or {}
-        buyer = user.get("username") or str(user.get("id") or "-")
+        buyer = (order.get("user") or {}).get("username") or str(order.get("buyerId") or "-")
         offer = order.get("offerDetails") or {}
         game = (offer.get("game") or {}).get("name") or "-"
         category = (offer.get("category") or {}).get("name") or "-"

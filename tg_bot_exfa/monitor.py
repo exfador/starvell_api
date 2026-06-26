@@ -42,7 +42,6 @@ def load_config() -> dict:
 
 async def start_monitor() -> None:
     try:
-        asyncio.create_task(_version_poll_loop(interval=300))
         await _monitor_once_and_loop()
     except Exception:
         logging.exception("monitor crashed")
@@ -60,12 +59,17 @@ async def _monitor_once_and_loop() -> None:
         logging.getLogger("exfador.monitor").info(json.dumps({"authorized": False, "user": None, "lots": [], "category_url": None}, ensure_ascii=False, indent=4))
         return
     user_id = auth["user"].get("id")
+    username = auth["user"].get("username")
     sid_cookie = auth.get("sid") or ""
     try:
         await send_auth_notification(True, auth.get("user"))
     except Exception:
         pass
-    lots_data = await find_user_lots(session_cookie, sid_cookie, user_id)
+    try:
+        lots_data = await find_user_lots(session_cookie, sid_cookie, user_id, username=username)
+    except Exception:
+        logging.getLogger("exfador.monitor").warning("find_user_lots_failed_initial", exc_info=True)
+        lots_data = {"lots": [], "my_games": None}
     lots = (lots_data or {}).get("lots") or []
     my_games_cookie = (lots_data or {}).get("my_games")
     category_url = None
@@ -439,8 +443,9 @@ async def _run_bump_loop(
                 await asyncio.sleep(60)
                 continue
             user_id = (auth.get("user") or {}).get("id")
+            username = (auth.get("user") or {}).get("username")
             sid_cookie = auth.get("sid") or sid_cookie
-            lots_data = await find_user_lots(session_cookie, sid_cookie, user_id, my_games_cookie=my_games_cookie)
+            lots_data = await find_user_lots(session_cookie, sid_cookie, user_id, my_games_cookie=my_games_cookie, username=username)
             lots_current = (lots_data or {}).get("lots") or []
             my_games_cookie = (lots_data or {}).get("my_games") or my_games_cookie
             category_url = None
@@ -900,6 +905,7 @@ async def _check_orders(session_cookie: str, db) -> None:
             notified = await db.is_order_notified(order_id)
             if notified:
                 continue
+            await db.mark_order_notified(order_id)
             try:
                 cfg_now = load_config()
                 ctx = PluginContext(session_cookie=session_cookie, db=db, config=cfg_now)
@@ -928,11 +934,16 @@ async def _check_orders(session_cookie: str, db) -> None:
                         if not code:
                             break
                         codes.append(code)
+                    if codes and len(codes) < qty:
+                        logging.getLogger("exfador.monitor").warning(
+                            f"autodelivery_shortage order_id={order_id} product={name} need={qty} got={len(codes)}"
+                        )
                     if codes:
                         joined = "\n".join(codes)
                         ad_tuple = (name, joined)
+                        delivered = False
                         try:
-                            buyer = (order.get("user") or {}).get("id")
+                            buyer = order.get("buyerId") or (order.get("user") or {}).get("id")
                             if buyer:
                                 chats_data = await fetch_chats(session_cookie)
                                 page_props = chats_data.get("pageProps", {}) if isinstance(chats_data, dict) else {}
@@ -957,8 +968,20 @@ async def _check_orders(session_cookie: str, db) -> None:
                                         wm_text = "[CXH BOT]"
                                     payload_text = f"{wm_text}\n\n{joined}" if wm_on else joined
                                     await send_chat_message(session_cookie, chat_id, payload_text)
+                                    delivered = True
                         except Exception:
-                            pass
+                            logging.getLogger("exfador.monitor").warning(
+                                f"autodelivery_send_failed order_id={order_id}", exc_info=True
+                            )
+                        if not delivered:
+                            try:
+                                await db.add_autodelivery_items(name, codes)
+                                logging.getLogger("exfador.monitor").warning(
+                                    f"autodelivery_requeued order_id={order_id} product={name} count={len(codes)}"
+                                )
+                            except Exception:
+                                pass
+                            ad_tuple = None
                 await send_order_notification(order, ad_tuple)
             except Exception:
                 try:
@@ -966,9 +989,8 @@ async def _check_orders(session_cookie: str, db) -> None:
                 except Exception:
                     pass
             try:
-                user = order.get("user") or {}
-                buyer = user.get("username") or str(user.get("id") or "-")
-                total_price = order.get("basePrice") or order.get("totalPrice") or 0
+                buyer = (order.get("user") or {}).get("username") or str(order.get("buyerId") or "-")
+                total_price = order.get("totalPrice") or order.get("basePrice") or 0
                 offer = order.get("offerDetails") or {}
                 game = (offer.get("game") or {}).get("name") or "-"
                 category = (offer.get("category") or {}).get("name") or "-"
@@ -977,7 +999,6 @@ async def _check_orders(session_cookie: str, db) -> None:
                 )
             except Exception:
                 pass
-            await db.mark_order_notified(order_id)
             cfg3 = load_config()
             if cfg3.get("DEBUG", True):
                 logging.getLogger("exfador.monitor").info(
@@ -1010,8 +1031,7 @@ async def _check_orders(session_cookie: str, db) -> None:
                 if status == "COMPLETED":
                     await send_order_completed_notification(order)
                     try:
-                        user = order.get("user") or {}
-                        buyer = user.get("username") or str(user.get("id") or "-")
+                        buyer = (order.get("user") or {}).get("username") or str(order.get("buyerId") or "-")
                         offer = order.get("offerDetails") or {}
                         game = (offer.get("game") or {}).get("name") or "-"
                         category = (offer.get("category") or {}).get("name") or "-"

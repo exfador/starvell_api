@@ -6,6 +6,8 @@ from typing import Optional
 
 import aiohttp
 
+from api.cookies import build_cookies, capture_cookies
+from api.http_headers import page_headers
 from api.rate_limiter import throttle
 
 
@@ -33,19 +35,13 @@ async def get_build_id(session_cookie: str) -> str:
 
 
 async def _fetch_build_id(session_cookie: str) -> str:
-    headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "ru,en;q=0.9",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-    }
-    cookies = {
-        "session": session_cookie,
-        "starvell.theme": "dark",
-    }
+    headers = page_headers()
+    cookies = build_cookies(session_cookie)
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
         await throttle()
         async with session.get("https://starvell.com/") as resp:
+            capture_cookies(session.cookie_jar)
             resp.raise_for_status()
             html = await resp.text()
     match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)

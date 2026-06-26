@@ -11,6 +11,8 @@ class Database:
 
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -26,14 +28,12 @@ class Database:
                 )
                 """
             )
-            try:
-                await db.execute("ALTER TABLE users ADD COLUMN notify_chat INTEGER DEFAULT 1")
-            except Exception:
-                pass
-            try:
-                await db.execute("ALTER TABLE users ADD COLUMN notify_orders INTEGER DEFAULT 1")
-            except Exception:
-                pass
+            cur = await db.execute("PRAGMA table_info(users)")
+            existing_cols = {row[1] for row in await cur.fetchall()}
+            await cur.close()
+            for col, ddl in (("notify_chat", "INTEGER DEFAULT 1"), ("notify_orders", "INTEGER DEFAULT 1")):
+                if col not in existing_cols:
+                    await db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_last_notified (
@@ -93,6 +93,9 @@ class Database:
                     created_at INTEGER DEFAULT 0
                 )
                 """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_autodelivery_product ON autodelivery_items(product, id)"
             )
             await db.commit()
 

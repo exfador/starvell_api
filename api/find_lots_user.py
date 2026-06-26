@@ -1,6 +1,8 @@
 import aiohttp
 from aiohttp import ClientResponseError
 
+from api.cookies import build_cookies, capture_cookies
+from api.http_headers import next_data_headers
 from api.next_data import get_build_id, reset_build_id
 from api.rate_limiter import throttle
 
@@ -17,32 +19,30 @@ async def find_user_lots(
     sid_cookie: str,
     user_id: int,
     my_games_cookie: str | None = None,
+    username: str | None = None,
 ) -> dict:
 
-    headers = {
-        "accept": "*/*",
-        "accept-language": "ru,en;q=0.9",
-        "referer": f"https://starvell.com/users/{user_id}",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 YaBrowser/25.8.0.0 Safari/537.36",
-        "x-nextjs-data": "1",
-    }
-    cookies = {"session": session_cookie, "starvell.theme": "dark", "starvell.time_zone": "Europe/Moscow"}
-
-    if my_games_cookie:
-        cookies["starvell.my_games"] = my_games_cookie
-    if sid_cookie:
-        cookies["sid"] = sid_cookie
+    if username:
+        referer = f"https://starvell.com/profile/{username}"
+    else:
+        referer = f"https://starvell.com/users/{user_id}"
+    headers = next_data_headers(referer)
+    cookies = build_cookies(session_cookie, sid_cookie=sid_cookie, my_games_cookie=my_games_cookie)
 
     timeout = aiohttp.ClientTimeout(total=20)
     last_exc = None
     data = None
     for attempt in range(2):
         build_id = await get_build_id(session_cookie)
-        url = f"https://starvell.com/_next/data/{build_id}/users/{user_id}.json?user_id={user_id}"
+        if username:
+            url = f"https://starvell.com/_next/data/{build_id}/profile/{username}.json"
+        else:
+            url = f"https://starvell.com/_next/data/{build_id}/users/{user_id}.json?user_id={user_id}"
         async with aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
             try:
                 await throttle()
                 async with session.get(url) as resp:
+                    capture_cookies(session.cookie_jar)
                     resp.raise_for_status()
                     data = await resp.json()
                     break

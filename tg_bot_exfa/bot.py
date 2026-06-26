@@ -98,8 +98,6 @@ async def run_bot() -> None:
         await bot.set_my_commands(base_cmds + plugin_cmds)
     except Exception:
         pass
-    except Exception:
-        pass
     try:
         full_text = (
 

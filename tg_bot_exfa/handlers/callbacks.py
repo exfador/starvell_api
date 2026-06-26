@@ -124,12 +124,13 @@ async def _send_reply_from_state(
         my_games_cookie = (auth or {}).get("my_games")
         if not my_games_cookie:
             uid = ((auth or {}).get("user") or {}).get("id")
+            uname = ((auth or {}).get("user") or {}).get("username")
             try:
                 uid_int = int(uid)
             except Exception:
                 uid_int = None
             if uid_int:
-                lots_data = await find_user_lots(session_cookie, sid_cookie or "", uid_int)
+                lots_data = await find_user_lots(session_cookie, sid_cookie or "", uid_int, username=uname)
                 my_games_cookie = (lots_data or {}).get("my_games") or my_games_cookie
     except Exception:
         sid_cookie = None
@@ -229,12 +230,13 @@ async def _send_reply_image_from_state(
         my_games_cookie = (auth or {}).get("my_games")
         if not my_games_cookie:
             uid = ((auth or {}).get("user") or {}).get("id")
+            uname = ((auth or {}).get("user") or {}).get("username")
             try:
                 uid_int = int(uid)
             except Exception:
                 uid_int = None
             if uid_int:
-                lots_data = await find_user_lots(session_cookie, sid_cookie or "", uid_int)
+                lots_data = await find_user_lots(session_cookie, sid_cookie or "", uid_int, username=uname)
                 my_games_cookie = (lots_data or {}).get("my_games") or my_games_cookie
     except Exception:
         sid_cookie = None
@@ -1003,6 +1005,11 @@ async def on_change_session(message: Message, state: FSMContext):
             obj = json.loads(cfg_path.read_text(encoding="utf-8") or "{}")
         obj["SESSION_COOKIE"] = new_session
         cfg_path.write_text(json.dumps(obj, ensure_ascii=False, indent=4), encoding="utf-8")
+        try:
+            from api.cookies import reset_dynamic_cookies
+            reset_dynamic_cookies()
+        except Exception:
+            pass
     except Exception as exc:
         await message.bot.edit_message_text(
             tr.t(lang, "session_change_failed", error=str(exc)),
