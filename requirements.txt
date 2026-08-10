@@ -1,7 +1,6 @@
 aiohttp>=3.9.0
-aiogram==3.18.0
+aiogram==3.30.0
 aiosqlite>=0.19.0
 requests>=2.31.0
 colorama>=0.4.6
 pydantic>=2.7.0,<3.0.0
-

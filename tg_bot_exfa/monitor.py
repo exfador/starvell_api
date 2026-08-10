@@ -1,13 +1,15 @@
 import asyncio
 import json
 import hashlib
+import math
 from typing import Any
 import logging
 import time
+import os
 
 from api.auth import fetch_homepage_data
 from api.find_lots_user import find_user_lots
-from api.offer_details import fetch_offer_detail
+from api.offer_details import fetch_offer_detail, offer_context
 from api.bump import bump_categories
 from api.chats import fetch_chats
 from api.messages import fetch_chat_messages
@@ -23,6 +25,50 @@ from version import VERSION
 from tg_bot_exfa.notify import send_update_available
 from tg_bot_exfa.plugins import PluginContext
 from api.rate_limiter import throttle_sync
+from api.response import StarvellResponseError, page_props
+from tg_bot_exfa.paths import CONFIG_PATH
+from tg_bot_exfa.template_renderer import render_template
+
+
+_orders_check_lock = asyncio.Lock()
+
+
+class AutodeliveryPending(RuntimeError):
+    pass
+
+
+def _safe_interval(value: Any, default: float, minimum: float = 1.0, maximum: float = 3600.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if not math.isfinite(parsed):
+        parsed = default
+    return min(maximum, max(minimum, parsed))
+
+
+async def _fetch_offer_details_bounded(
+    session_cookie: str,
+    lots: list[dict],
+    sid_cookie: str,
+    my_games_cookie: str | None,
+    batch_size: int = 5,
+) -> list[Any]:
+    results: list[Any] = []
+    safe_batch_size = max(1, min(10, int(batch_size)))
+    for offset in range(0, len(lots), safe_batch_size):
+        batch = lots[offset : offset + safe_batch_size]
+        tasks = [
+            fetch_offer_detail(
+                session_cookie,
+                lot["id"],
+                sid_cookie,
+                my_games_cookie=my_games_cookie,
+            )
+            for lot in batch
+        ]
+        results.extend(await asyncio.gather(*tasks, return_exceptions=True))
+    return results
 
 
 def _normalize_id(value):
@@ -35,16 +81,54 @@ def _normalize_id(value):
     return None
 
 
+def _seen_bucket(seen_messages: dict[str, set[str]], chat_id: str, max_chats: int = 500) -> set[str]:
+    if chat_id not in seen_messages and len(seen_messages) >= max_chats:
+        seen_messages.clear()
+    return seen_messages.setdefault(chat_id, set())
+
+
+def _remember_seen(bucket: set[str], message_id: str, max_messages: int = 500) -> None:
+    if len(bucket) >= max_messages:
+        bucket.clear()
+    bucket.add(message_id)
+
+
 def load_config() -> dict:
-    with open("config/osnova.json", "r", encoding="utf-8") as f:
-        return json.load(f)
+    data: dict[str, Any] = {}
+    if CONFIG_PATH.exists():
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            loaded = json.load(f) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError("Configuration root must be a JSON object")
+        data.update(loaded)
+    if os.getenv("SESSION_COOKIE"):
+        data["SESSION_COOKIE"] = os.environ["SESSION_COOKIE"]
+    return data
 
 
 async def start_monitor() -> None:
-    try:
-        await _monitor_once_and_loop()
-    except Exception:
-        logging.exception("monitor crashed")
+    while True:
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(_version_poll_loop(interval=300))
+                tasks.create_task(_monitor_supervisor_loop())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("monitor crashed; restarting")
+        await asyncio.sleep(5)
+
+
+async def _monitor_supervisor_loop(retry_interval: float = 60) -> None:
+    log = logging.getLogger("exfador.monitor")
+    while True:
+        try:
+            await _monitor_once_and_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("monitor_iteration_failed")
+        await asyncio.sleep(max(5, float(retry_interval)))
 
 
 async def _monitor_once_and_loop() -> None:
@@ -59,30 +143,26 @@ async def _monitor_once_and_loop() -> None:
         logging.getLogger("exfador.monitor").info(json.dumps({"authorized": False, "user": None, "lots": [], "category_url": None}, ensure_ascii=False, indent=4))
         return
     user_id = auth["user"].get("id")
-    username = auth["user"].get("username")
+    username = auth["user"].get("username") or auth["user"].get("login")
     sid_cookie = auth.get("sid") or ""
     try:
         await send_auth_notification(True, auth.get("user"))
     except Exception:
         pass
-    try:
-        lots_data = await find_user_lots(session_cookie, sid_cookie, user_id, username=username)
-    except Exception:
-        logging.getLogger("exfador.monitor").warning("find_user_lots_failed_initial", exc_info=True)
-        lots_data = {"lots": [], "my_games": None}
+    lots_data = await find_user_lots(session_cookie, sid_cookie, user_id, username=username)
     lots = (lots_data or {}).get("lots") or []
     my_games_cookie = (lots_data or {}).get("my_games")
     category_url = None
-    category_id_by_offer: dict[int, int] = {}
-    game_ids_by_offer: dict[int, int] = {}
+    category_id_by_offer: dict[str, int] = {}
+    game_ids_by_offer: dict[str, int] = {}
     if lots:
         for lot in lots:
-            oid = lot.get("id")
+            oid = _normalize_id(lot.get("id"))
             if not category_url:
                 cu = lot.get("category_url")
                 if isinstance(cu, str) and cu.strip():
                     category_url = cu.strip()
-            if not isinstance(oid, int):
+            if not oid:
                 continue
             cid = lot.get("category_id")
             gid = lot.get("game_id")
@@ -91,36 +171,41 @@ async def _monitor_once_and_loop() -> None:
             if isinstance(gid, int):
                 game_ids_by_offer[oid] = gid
 
-        need_details = [
-            lot
-            for lot in lots
-            if isinstance(lot.get("id"), int)
-            and (lot["id"] not in category_id_by_offer or lot["id"] not in game_ids_by_offer)
-        ]
+        need_details = []
+        for lot in lots:
+            offer_key = _normalize_id(lot.get("id"))
+            if offer_key and (
+                offer_key not in category_id_by_offer or offer_key not in game_ids_by_offer
+            ):
+                need_details.append(lot)
         if need_details:
-            tasks = [fetch_offer_detail(session_cookie, lot.get("id"), sid_cookie, my_games_cookie=my_games_cookie) for lot in need_details]
-            details = await asyncio.gather(*tasks, return_exceptions=True)
+            details = await _fetch_offer_details_bounded(
+                session_cookie,
+                need_details,
+                sid_cookie,
+                my_games_cookie,
+            )
             for d in details:
                 if isinstance(d, Exception):
                     continue
-                page_props = (d or {}).get("pageProps", {})
-                offer = page_props.get("offer") or {}
-                game = offer.get("game") or {}
-                category = offer.get("category") or {}
-                oid = offer.get("id")
+                try:
+                    offer, game, category = offer_context(d)
+                except StarvellResponseError:
+                    continue
+                oid = _normalize_id(offer.get("publicId") or offer.get("id"))
                 cid = None
                 if isinstance(category.get("id"), int):
                     cid = category.get("id")
                 elif isinstance(offer.get("categoryId"), int):
                     cid = offer.get("categoryId")
-                if isinstance(oid, int) and isinstance(cid, int):
+                if oid and isinstance(cid, int):
                     category_id_by_offer[oid] = cid
                 gid = None
                 if isinstance(offer.get("gameId"), int):
                     gid = offer.get("gameId")
                 elif isinstance(game.get("id"), int):
                     gid = game.get("id")
-                if isinstance(oid, int) and isinstance(gid, int):
+                if oid and isinstance(gid, int):
                     game_ids_by_offer[oid] = gid
                 gslug = game.get("slug")
                 cslug = category.get("slug")
@@ -128,9 +213,10 @@ async def _monitor_once_and_loop() -> None:
                     category_url = f"https://starvell.com/{gslug}/{cslug}/trade"
     enriched_lots = []
     for lot in lots:
-        if isinstance(lot.get("id"), int) and lot["id"] in category_id_by_offer:
+        offer_key = _normalize_id(lot.get("id"))
+        if offer_key and offer_key in category_id_by_offer:
             new_lot = dict(lot)
-            new_lot["category_id"] = category_id_by_offer[lot["id"]]
+            new_lot["category_id"] = category_id_by_offer[offer_key]
             enriched_lots.append(new_lot)
         else:
             enriched_lots.append(lot)
@@ -156,28 +242,31 @@ async def _monitor_once_and_loop() -> None:
             game_to_categories.setdefault(gid, set()).add(cid)
     db = app.app_context.db
     user_id = await _check_chats(session_cookie, db, user_id=user_id)
-    poll_interval = cfg.get("CHAT_POLL_INTERVAL", 5)
-    asyncio.create_task(_chat_poll_loop(db, user_id=user_id, interval=poll_interval))
-    orders_interval = cfg.get("ORDERS_POLL_INTERVAL", 10)
-    asyncio.create_task(_orders_poll_loop(db, interval=orders_interval))
-    announce_interval = cfg.get("REMOTE_INFO_INTERVAL", 120)
-    asyncio.create_task(_remote_poll_loop(interval=announce_interval))
-    asyncio.create_task(_version_poll_loop(interval=300))
-    if game_to_categories:
-        await _run_bump_loop(
-            session_cookie,
-            sid_cookie,
-            game_to_categories,
-            category_url,
-            enriched_lots,
-            auth.get("user"),
-            db,
-            my_games_cookie=my_games_cookie,
-        )
+    poll_interval = _safe_interval(cfg.get("CHAT_POLL_INTERVAL"), 5)
+    orders_interval = _safe_interval(cfg.get("ORDERS_POLL_INTERVAL"), 10)
+    announce_interval = _safe_interval(cfg.get("REMOTE_INFO_INTERVAL"), 120, minimum=30)
+    async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(_chat_poll_loop(db, user_id=user_id, interval=poll_interval))
+        tasks.create_task(_orders_poll_loop(db, interval=orders_interval))
+        tasks.create_task(_remote_poll_loop(interval=announce_interval))
+        if game_to_categories:
+            tasks.create_task(
+                _run_bump_loop(
+                    session_cookie,
+                    sid_cookie,
+                    game_to_categories,
+                    category_url,
+                    enriched_lots,
+                    auth.get("user"),
+                    db,
+                    my_games_cookie=my_games_cookie,
+                )
+            )
 
 
 async def _chat_poll_loop(db, user_id, interval: float = 30) -> None:
     log = logging.getLogger("exfador.monitor")
+    interval = _safe_interval(interval, 30)
     seen_messages: dict[str, set[str]] = {}
     while True:
         try:
@@ -194,6 +283,7 @@ async def _chat_poll_loop(db, user_id, interval: float = 30) -> None:
 
 async def _orders_poll_loop(db, interval: float = 15) -> None:
     log = logging.getLogger("exfador.monitor")
+    interval = _safe_interval(interval, 15)
     while True:
         try:
             cfg = load_config()
@@ -209,6 +299,7 @@ async def _orders_poll_loop(db, interval: float = 15) -> None:
 
 async def _remote_poll_loop(interval: float = 120) -> None:
     log = logging.getLogger("exfador.monitor")
+    interval = _safe_interval(interval, 120, minimum=30)
     _last_rev: str | None = None
 
     def _safe_first_file(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -265,7 +356,6 @@ async def _remote_poll_loop(interval: float = 120) -> None:
                 tag_value = _compute_fallback_tag(content_text, data)
             if _last_rev == tag_value and not ignore_last_tag:
                 return None
-            _last_rev = tag_value
             return payload
         except Exception:
             return None
@@ -313,7 +403,7 @@ async def _remote_poll_loop(interval: float = 120) -> None:
             return items
     while True:
         try:
-            payload = read_cxh_descriptor()
+            payload = await asyncio.to_thread(read_cxh_descriptor)
             if isinstance(payload, dict):
                 try:
                     db = app.app_context.db if app.app_context else None
@@ -334,15 +424,18 @@ async def _remote_poll_loop(interval: float = 120) -> None:
                         except Exception:
                             pass
                     if should_send:
-                        await sync_digest_view(payload)
+                        await sync_digest_view(payload, event_id=key)
                         if db and key:
                             try:
                                 await db.mark_digest_sent(key)
                             except Exception:
                                 pass
+                        tag_value = str(payload.get("tag") or "").strip()
+                        if tag_value:
+                            _last_rev = tag_value
                 except Exception:
                     pass
-            comments_payloads = read_owner_notes()
+            comments_payloads = await asyncio.to_thread(read_owner_notes)
             if comments_payloads:
                 for p in comments_payloads:
                     try:
@@ -365,7 +458,7 @@ async def _remote_poll_loop(interval: float = 120) -> None:
                             except Exception:
                                 pass
                         if should_send:
-                            await sync_digest_view({"text": text})
+                            await sync_digest_view({"text": text}, event_id=key)
                             if db and key:
                                 try:
                                     await db.mark_digest_sent(key)
@@ -381,14 +474,18 @@ async def _remote_poll_loop(interval: float = 120) -> None:
 async def _version_poll_loop(interval: float = 300) -> None:
     log = logging.getLogger("exfador.monitor")
     last_notified: str | None = None
+
+    def fetch_tags():
+        throttle_sync()
+        return requests.get(
+            "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
+            headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+            timeout=10,
+        )
+
     while True:
         try:
-            throttle_sync()
-            resp = requests.get(
-                "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
-                headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
-                timeout=10,
-            )
+            resp = await asyncio.to_thread(fetch_tags)
             if resp.status_code == 200:
                 arr = resp.json() or []
                 tag_item = None
@@ -443,22 +540,28 @@ async def _run_bump_loop(
                 await asyncio.sleep(60)
                 continue
             user_id = (auth.get("user") or {}).get("id")
-            username = (auth.get("user") or {}).get("username")
+            username = (auth.get("user") or {}).get("username") or (auth.get("user") or {}).get("login")
             sid_cookie = auth.get("sid") or sid_cookie
-            lots_data = await find_user_lots(session_cookie, sid_cookie, user_id, my_games_cookie=my_games_cookie, username=username)
+            lots_data = await find_user_lots(
+                session_cookie,
+                sid_cookie,
+                user_id,
+                username=username,
+                my_games_cookie=my_games_cookie,
+            )
             lots_current = (lots_data or {}).get("lots") or []
             my_games_cookie = (lots_data or {}).get("my_games") or my_games_cookie
             category_url = None
-            category_id_by_offer: dict[int, int] = {}
-            game_ids_by_offer: dict[int, int] = {}
+            category_id_by_offer: dict[str, int] = {}
+            game_ids_by_offer: dict[str, int] = {}
             if lots_current:
                 for lot in lots_current:
-                    oid = lot.get("id")
+                    oid = _normalize_id(lot.get("id"))
                     if not category_url:
                         cu = lot.get("category_url")
                         if isinstance(cu, str) and cu.strip():
                             category_url = cu.strip()
-                    if not isinstance(oid, int):
+                    if not oid:
                         continue
                     cid = lot.get("category_id")
                     gid = lot.get("game_id")
@@ -467,40 +570,41 @@ async def _run_bump_loop(
                     if isinstance(gid, int):
                         game_ids_by_offer[oid] = gid
 
-                need_details = [
-                    lot
-                    for lot in lots_current
-                    if isinstance(lot.get("id"), int)
-                    and (lot["id"] not in category_id_by_offer or lot["id"] not in game_ids_by_offer)
-                ]
+                need_details = []
+                for lot in lots_current:
+                    offer_key = _normalize_id(lot.get("id"))
+                    if offer_key and (
+                        offer_key not in category_id_by_offer or offer_key not in game_ids_by_offer
+                    ):
+                        need_details.append(lot)
                 if need_details:
-                    tasks_details = [
-                        fetch_offer_detail(session_cookie, lot.get("id"), sid_cookie, my_games_cookie=my_games_cookie)
-                        for lot in need_details
-                        if lot.get("id")
-                    ]
-                    details = await asyncio.gather(*tasks_details, return_exceptions=True)
+                    details = await _fetch_offer_details_bounded(
+                        session_cookie,
+                        need_details,
+                        sid_cookie,
+                        my_games_cookie,
+                    )
                     for d in details:
                         if isinstance(d, Exception):
                             continue
-                        page_props = (d or {}).get("pageProps", {})
-                        offer = page_props.get("offer") or {}
-                        game = offer.get("game") or {}
-                        category = offer.get("category") or {}
-                        oid = offer.get("id")
+                        try:
+                            offer, game, category = offer_context(d)
+                        except StarvellResponseError:
+                            continue
+                        oid = _normalize_id(offer.get("publicId") or offer.get("id"))
                         cid = None
                         if isinstance(category.get("id"), int):
                             cid = category.get("id")
                         elif isinstance(offer.get("categoryId"), int):
                             cid = offer.get("categoryId")
-                        if isinstance(oid, int) and isinstance(cid, int):
+                        if oid and isinstance(cid, int):
                             category_id_by_offer[oid] = cid
                         gid = None
                         if isinstance(offer.get("gameId"), int):
                             gid = offer.get("gameId")
                         elif isinstance(game.get("id"), int):
                             gid = game.get("id")
-                        if isinstance(oid, int) and isinstance(gid, int):
+                        if oid and isinstance(gid, int):
                             game_ids_by_offer[oid] = gid
                         gslug = game.get("slug")
                         cslug = category.get("slug")
@@ -511,9 +615,10 @@ async def _run_bump_loop(
                 category_url = referer
             enriched_lots = []
             for lot in lots_current or []:
-                if isinstance(lot.get("id"), int) and lot["id"] in category_id_by_offer:
+                offer_key = _normalize_id(lot.get("id"))
+                if offer_key and offer_key in category_id_by_offer:
                     new_lot = dict(lot)
-                    new_lot["category_id"] = category_id_by_offer[lot["id"]]
+                    new_lot["category_id"] = category_id_by_offer[offer_key]
                     enriched_lots.append(new_lot)
                 else:
                     enriched_lots.append(lot)
@@ -630,9 +735,9 @@ async def _check_chats(
     except Exception as exc:
         logging.getLogger("exfador.monitor").warning(f"chat_fetch_failed error={exc}")
         return user_id
-    page_props = data.get("pageProps", {})
-    chats = page_props.get("chats", [])
-    user = page_props.get("user") or {}
+    props = page_props(data, "check chats")
+    chats = props.get("chats", [])
+    user = props.get("user") or {}
     fetched_user_id = user.get("id")
     if fetched_user_id is not None:
         user_id = fetched_user_id
@@ -663,16 +768,24 @@ async def _check_chats(
         chat_id = chat.get("id")
         if not chat_id:
             continue
-        unread = chat.get("unreadMessageCount", 0)
+        try:
+            unread = max(0, int(chat.get("unreadMessageCount", 0) or 0))
+        except (TypeError, ValueError):
+            unread = 0
         last_message = chat.get("lastMessage") or {}
         msg_id = last_message.get("id")
         if msg_id is not None:
             msg_id = str(msg_id)
         metadata = last_message.get("metadata") or {}
-        if not msg_id or metadata.get("isAuto"):
+        if not msg_id:
             continue
-        processed_for_chat = seen_messages.setdefault(chat_id, set()) if seen_messages is not None else None
+        processed_for_chat = _seen_bucket(seen_messages, chat_id) if seen_messages is not None else None
+        stored = await db.get_last_notified_message(chat_id)
+        if stored is not None:
+            stored = str(stored)
         if processed_for_chat is not None and msg_id in processed_for_chat:
+            if stored != msg_id:
+                await db.set_last_notified_message(chat_id, msg_id)
             continue
         participants = chat.get("participants") or []
         other_username = ""
@@ -691,28 +804,29 @@ async def _check_chats(
                 interlocutor_id = raw_pid
         if not other_username and participants:
             other_username = participants[0].get("username") or ""
-        stored = await db.get_last_notified_message(chat_id)
-        if stored is not None:
-            stored = str(stored)
         to_notify: list[dict] = []
         last_msg_author_norm = None
         last_msg_from_self = False
-        if stored is None:
+        if stored is None and unread <= 0:
             if msg_id:
                 try:
                     await db.set_last_notified_message(chat_id, msg_id)
                 except Exception:
                     pass
             if processed_for_chat is not None:
-                processed_for_chat.add(msg_id)
+                _remember_seen(processed_for_chat, msg_id)
             continue
+        if stored is None:
+            stored = ""
         if msg_id and stored and msg_id == stored:
             if processed_for_chat is not None:
-                processed_for_chat.add(msg_id)
+                _remember_seen(processed_for_chat, msg_id)
             continue
+        scan_succeeded = False
         try:
-            limit = max(unread, 50) if stored else max(unread, 20)
+            limit = min(100, max(unread, 50))
             messages = await fetch_chat_messages(session_cookie, chat_id, limit=limit, interlocutor_id=interlocutor_id)
+            scan_succeeded = True
             new_items: list[dict] = []
             for msg in messages:
                 if not isinstance(msg, dict):
@@ -760,7 +874,9 @@ async def _check_chats(
                 fb_author_data = last_message.get("author") or {}
                 fb_author_id = fb_author_data.get("id")
             fb_author_norm = _normalize_id(fb_author_id)
-            if fb_author_norm and user_id_norm and fb_author_norm == user_id_norm:
+            if metadata.get("isAuto"):
+                to_notify = []
+            elif fb_author_norm and user_id_norm and fb_author_norm == user_id_norm:
                 to_notify = []
             else:
                 content = (last_message.get("content") or "").strip()
@@ -796,18 +912,30 @@ async def _check_chats(
                 if pid_norm and pid_norm == last_author_id_norm:
                     safe_username = pun or safe_username
                     break
-        if stored is None and not to_notify and (user_id_norm is None or last_author_id_norm != user_id_norm):
+        if (
+            stored is None
+            and not metadata.get("isAuto")
+            and not to_notify
+            and (user_id_norm is None or last_author_id_norm != user_id_norm)
+        ):
             content = (last_message.get("content") or "").strip()
             if content:
                 to_notify = [{"id": msg_id, "text": content, "author_id": last_author_id_norm}]
-        if not to_notify and stored != msg_id and (user_id_norm is None or last_author_id_norm != user_id_norm):
+        if (
+            not metadata.get("isAuto")
+            and not to_notify
+            and stored != msg_id
+            and (user_id_norm is None or last_author_id_norm != user_id_norm)
+        ):
             content = (last_message.get("content") or "").strip()
             if content:
                 to_notify = [{"id": msg_id, "text": content, "author_id": last_author_id_norm}]
 
         if not to_notify:
+            if scan_succeeded and stored != msg_id:
+                await db.set_last_notified_message(chat_id, msg_id)
             if processed_for_chat is not None:
-                processed_for_chat.add(msg_id)
+                _remember_seen(processed_for_chat, msg_id)
             continue
 
         last_user_ts: int | None = None
@@ -817,6 +945,7 @@ async def _check_chats(
             except Exception:
                 last_user_ts = None
 
+        all_processed = True
         for item in to_notify:
             mid = item.get("id") if isinstance(item, dict) else None
             if mid is not None:
@@ -833,34 +962,58 @@ async def _check_chats(
                 continue
             try:
                 kind = "📷" if image_url else "📩"
-                logging.getLogger("exfador.pretty.chat").info(f"{kind} Новое сообщение от {safe_username}: {safe_text}")
+                logging.getLogger("exfador.pretty.chat").info(
+                    "%s Новое сообщение chat_id=%s sender=%s length=%s",
+                    kind,
+                    chat_id,
+                    safe_username,
+                    len(safe_text),
+                )
 
                 if welcome_enabled and welcome_cooldown_seconds > 0:
                     now_ts = int(time.time())
                     should_send_welcome = False
                     if last_user_ts is None or now_ts - last_user_ts >= welcome_cooldown_seconds:
                         should_send_welcome = True
-                        last_user_ts = now_ts
                     if should_send_welcome:
                         try:
+                            rendered_welcome = render_template(
+                                welcome_text_raw,
+                                {
+                                    "buyer": safe_username,
+                                    "chat_id": chat_id,
+                                    "message_text": safe_text,
+                                },
+                            )
                             welcome_payload = (
-                                f"{wm_text_global}\n\n{welcome_text_raw}" if wm_on_global else welcome_text_raw
+                                f"{wm_text_global}\n\n{rendered_welcome}"
+                                if wm_on_global
+                                else rendered_welcome
                             )
                             await send_chat_message(session_cookie, chat_id, welcome_payload)
+                            last_user_ts = now_ts
                         except Exception as exc_w:
                             logging.getLogger("exfador.monitor").warning(
                                 f"welcome_send_failed chat_id={chat_id} error={exc_w}"
                             )
 
                 try:
-                    await send_chat_notification(safe_username, safe_text, chat_id, image_url=image_url)
+                    await send_chat_notification(
+                        safe_username,
+                        safe_text,
+                        chat_id,
+                        image_url=image_url,
+                        event_id=mid,
+                    )
                 except Exception as exc_notify:
                     logging.getLogger("exfador.monitor").warning(
                         f"chat_notify_failed chat_id={chat_id} msg_id={mid} error={exc_notify}"
                     )
+                    all_processed = False
+                    break
                 await db.set_last_notified_message(chat_id, mid)
                 if processed_for_chat is not None:
-                    processed_for_chat.add(mid)
+                    _remember_seen(processed_for_chat, mid)
                 skip_plugins = (item.get("_skip_plugins") if isinstance(item, dict) else False) or False
                 if not skip_plugins:
                     try:
@@ -877,6 +1030,11 @@ async def _check_chats(
                 logging.getLogger("exfador.monitor").warning(
                     f"chat_message_process_failed chat_id={chat_id} msg_id={mid} error={exc}"
                 )
+                all_processed = False
+                break
+
+        if all_processed and scan_succeeded and stored != msg_id:
+            await db.set_last_notified_message(chat_id, msg_id)
 
         if welcome_enabled and welcome_cooldown_seconds > 0 and last_user_ts is not None:
             try:
@@ -886,14 +1044,133 @@ async def _check_chats(
     return user_id
 
 
-async def _check_orders(session_cookie: str, db) -> None:
+async def _deliver_autodelivery_codes(session_cookie: str, db, order: dict, product_name: str) -> tuple[str, str] | None:
+    order_id = _normalize_id(order.get("id"))
+    if not order_id:
+        raise RuntimeError("autodelivery order id is missing")
+    quantity = max(1, int(order.get("quantity") or 1))
+    delivery = await db.reserve_order_delivery(order_id, product_name, quantity)
+    if delivery is None:
+        return None
+    state = str(delivery.get("state") or "")
+    if state in {"buyer_sent", "owner_notified"}:
+        return product_name, "\n".join(delivery.get("item_values") or [])
+    if state == "insufficient":
+        available = int(delivery.get("available") or 0)
+        raise RuntimeError(
+            f"autodelivery stock is insufficient: required={quantity}, available={available}"
+        )
+    if state == "sending":
+        joined = "\n".join(delivery.get("item_values") or [])
+        delivery_chat_id = _normalize_id(delivery.get("chat_id"))
+        if joined and delivery_chat_id:
+            try:
+                recent = await fetch_chat_messages(
+                    session_cookie,
+                    delivery_chat_id,
+                    limit=20,
+                )
+                if any(joined in str((message or {}).get("content") or "") for message in recent):
+                    await db.mark_order_delivery_sent(order_id)
+                    return product_name, joined
+            except Exception as exc:
+                logging.getLogger("exfador.monitor").warning(
+                    "autodelivery_reconcile_failed order_id=%s error=%s",
+                    order_id,
+                    exc,
+                )
+        raise AutodeliveryPending(
+            "Статус отправки покупателю неоднозначен. Повтор заблокирован; "
+            "бот проверяет историю чата."
+        )
+    if state != "reserved":
+        raise RuntimeError(f"unsupported autodelivery state: {state}")
+
+    buyer_id = _normalize_id((order.get("user") or {}).get("id"))
+    if not buyer_id:
+        raise RuntimeError("autodelivery buyer is missing")
+
+    chats_data = await fetch_chats(session_cookie)
+    chats = page_props(chats_data, "deliver autodelivery codes").get("chats") or []
+    chat_id = None
+    for chat in chats:
+        for participant in (chat.get("participants") or []):
+            if _normalize_id((participant or {}).get("id")) == buyer_id:
+                chat_id = chat.get("id")
+                break
+        if chat_id:
+            break
+    if not chat_id:
+        raise RuntimeError("autodelivery chat is missing")
+
+    codes = [str(value) for value in delivery.get("item_values") or []]
+    if len(codes) != quantity:
+        raise RuntimeError("autodelivery reservation has an invalid quantity")
+    joined = "\n".join(codes)
     try:
-        data = await fetch_sells(session_cookie)
+        cfg = load_config()
+        watermark_on = bool(cfg.get("WATERMARK_ON", True))
+        watermark_text = str(cfg.get("WATERMARK_TEXT", "[CXH BOT]"))
+    except Exception:
+        watermark_on = True
+        watermark_text = "[CXH BOT]"
+    payload = f"{watermark_text}\n\n{joined}" if watermark_on else joined
+    claimed = await db.mark_order_delivery_sending(order_id, str(chat_id))
+    if not claimed:
+        current = await db.get_order_delivery(order_id)
+        if current and current.get("state") in {"buyer_sent", "owner_notified"}:
+            return product_name, "\n".join(current.get("item_values") or [])
+        return product_name, (
+            "⚠️ Автовыдача уже обрабатывается другим процессом; "
+            "повторная отправка заблокирована."
+        )
+    try:
+        await send_chat_message(session_cookie, chat_id, payload)
+        await db.mark_order_delivery_sent(order_id)
+    except Exception as exc:
+        await db.mark_order_delivery_error(order_id, str(exc))
+        raise AutodeliveryPending(
+            "Не удалось подтвердить отправку покупателю. Коды зарезервированы, "
+            "повтор отключён до сверки с историей чата."
+        )
+    return product_name, joined
+
+
+async def _check_orders(session_cookie: str, db) -> None:
+    async with _orders_check_lock:
+        await _check_orders_once(session_cookie, db)
+
+
+async def _fetch_recent_orders(session_cookie: str, max_pages: int = 3) -> list[dict]:
+    orders: list[dict] = []
+    seen_ids: set[str] = set()
+    for page_number in range(1, max(1, min(10, int(max_pages))) + 1):
+        data = await fetch_sells(session_cookie, page=page_number if page_number > 1 else None)
+        page_orders = page_props(data, "check orders").get("orders") or []
+        if not page_orders:
+            break
+        added = 0
+        for order in page_orders:
+            if not isinstance(order, dict):
+                continue
+            order_id = _normalize_id(order.get("id"))
+            if order_id and order_id in seen_ids:
+                continue
+            if order_id:
+                seen_ids.add(order_id)
+            orders.append(order)
+            added += 1
+        if added == 0:
+            break
+    return orders
+
+
+async def _check_orders_once(session_cookie: str, db) -> None:
+    try:
+        orders = await _fetch_recent_orders(session_cookie)
     except Exception as exc:
         logging.getLogger("exfador.monitor").warning(f"orders_fetch_failed error={exc}")
         return
-    page_props = data.get("pageProps", {})
-    orders = page_props.get("orders", [])
     for order in orders:
         try:
             if not isinstance(order, dict):
@@ -905,15 +1182,6 @@ async def _check_orders(session_cookie: str, db) -> None:
             notified = await db.is_order_notified(order_id)
             if notified:
                 continue
-            await db.mark_order_notified(order_id)
-            try:
-                cfg_now = load_config()
-                ctx = PluginContext(session_cookie=session_cookie, db=db, config=cfg_now)
-                pm = app.app_context.plugin_manager if app.app_context else None
-                if pm:
-                    await pm.dispatch_order_created(order, ctx)
-            except Exception:
-                pass
             try:
                 offer = order.get("offerDetails") or {}
                 offer_obj = offer.get("offer") or {}
@@ -925,72 +1193,49 @@ async def _check_orders(session_cookie: str, db) -> None:
                     or str(offer.get("name") or "").strip()
                     or str(offer.get("title") or "").strip()
                 )
-                ad_tuple = None
-                codes: list[str] = []
-                qty = int(order.get("quantity") or 1)
-                if name:
-                    for _ in range(max(1, qty)):
-                        code = await db.pop_autodelivery_item(name)
-                        if not code:
-                            break
-                        codes.append(code)
-                    if codes and len(codes) < qty:
-                        logging.getLogger("exfador.monitor").warning(
-                            f"autodelivery_shortage order_id={order_id} product={name} need={qty} got={len(codes)}"
-                        )
-                    if codes:
-                        joined = "\n".join(codes)
-                        ad_tuple = (name, joined)
-                        delivered = False
-                        try:
-                            buyer = order.get("buyerId") or (order.get("user") or {}).get("id")
-                            if buyer:
-                                chats_data = await fetch_chats(session_cookie)
-                                page_props = chats_data.get("pageProps", {}) if isinstance(chats_data, dict) else {}
-                                chats = page_props.get("chats", [])
-                                chat_id = None
-                                for ch in chats:
-                                    parts = ch.get("participants") or []
-                                    for p in parts:
-                                        if (p or {}).get("id") == buyer:
-                                            chat_id = ch.get("id")
-                                            break
-                                    if chat_id:
-                                        break
-                                if chat_id:
-                                    from api.send_message import send_chat_message
-                                    try:
-                                        cfg_loc = load_config()
-                                        wm_on = bool(cfg_loc.get("WATERMARK_ON", True))
-                                        wm_text = str(cfg_loc.get("WATERMARK_TEXT", "[CXH BOT]"))
-                                    except Exception:
-                                        wm_on = True
-                                        wm_text = "[CXH BOT]"
-                                    payload_text = f"{wm_text}\n\n{joined}" if wm_on else joined
-                                    await send_chat_message(session_cookie, chat_id, payload_text)
-                                    delivered = True
-                        except Exception:
-                            logging.getLogger("exfador.monitor").warning(
-                                f"autodelivery_send_failed order_id={order_id}", exc_info=True
-                            )
-                        if not delivered:
-                            try:
-                                await db.add_autodelivery_items(name, codes)
-                                logging.getLogger("exfador.monitor").warning(
-                                    f"autodelivery_requeued order_id={order_id} product={name} count={len(codes)}"
-                                )
-                            except Exception:
-                                pass
-                            ad_tuple = None
-                await send_order_notification(order, ad_tuple)
-            except Exception:
+                ad_tuple = await _deliver_autodelivery_codes(session_cookie, db, order, name) if name else None
+            except AutodeliveryPending as exc:
                 try:
-                    await send_order_notification(order, None)
-                except Exception:
-                    pass
+                    await send_order_notification(
+                        order,
+                        (name, f"⚠️ {exc}"),
+                        event_id=f"{order_id}:autodelivery-warning",
+                    )
+                except Exception as notify_error:
+                    logging.getLogger("exfador.monitor").warning(
+                        "autodelivery_warning_failed order_id=%s error=%s",
+                        order_id,
+                        notify_error,
+                    )
+                continue
+            except Exception as exc:
+                logging.getLogger("exfador.monitor").warning(
+                    "autodelivery_failed order_id=%s error=%s",
+                    order_id,
+                    exc,
+                )
+                continue
             try:
-                buyer = (order.get("user") or {}).get("username") or str(order.get("buyerId") or "-")
-                total_price = order.get("totalPrice") or order.get("basePrice") or 0
+                cfg_now = load_config()
+                ctx = PluginContext(session_cookie=session_cookie, db=db, config=cfg_now)
+                pm = app.app_context.plugin_manager if app.app_context else None
+                if pm:
+                    await pm.dispatch_order_created(order, ctx)
+            except Exception:
+                pass
+            try:
+                await send_order_notification(order, ad_tuple)
+            except Exception as notify_error:
+                logging.getLogger("exfador.monitor").warning(
+                    "order_notification_failed order_id=%s error=%s",
+                    order_id,
+                    notify_error,
+                )
+                continue
+            try:
+                user = order.get("user") or {}
+                buyer = user.get("username") or str(user.get("id") or "-")
+                total_price = order.get("basePrice") or order.get("totalPrice") or 0
                 offer = order.get("offerDetails") or {}
                 game = (offer.get("game") or {}).get("name") or "-"
                 category = (offer.get("category") or {}).get("name") or "-"
@@ -999,6 +1244,9 @@ async def _check_orders(session_cookie: str, db) -> None:
                 )
             except Exception:
                 pass
+            if ad_tuple is not None:
+                await db.mark_order_delivery_owner_notified(order_id)
+            await db.mark_order_notified(order_id)
             cfg3 = load_config()
             if cfg3.get("DEBUG", True):
                 logging.getLogger("exfador.monitor").info(
@@ -1027,11 +1275,11 @@ async def _check_orders(session_cookie: str, db) -> None:
                 await db.set_order_status(order_id, status)
                 continue
             if prev != status:
-                await db.set_order_status(order_id, status)
                 if status == "COMPLETED":
                     await send_order_completed_notification(order)
                     try:
-                        buyer = (order.get("user") or {}).get("username") or str(order.get("buyerId") or "-")
+                        user = order.get("user") or {}
+                        buyer = user.get("username") or str(user.get("id") or "-")
                         offer = order.get("offerDetails") or {}
                         game = (offer.get("game") or {}).get("name") or "-"
                         category = (offer.get("category") or {}).get("name") or "-"
@@ -1040,7 +1288,6 @@ async def _check_orders(session_cookie: str, db) -> None:
                         )
                     except Exception:
                         pass
+                await db.set_order_status(order_id, status)
         except Exception as exc:
             logging.getLogger("exfador.monitor").warning(f"order_complete_check_failed order_id={order.get('id')} error={exc}")
-
-

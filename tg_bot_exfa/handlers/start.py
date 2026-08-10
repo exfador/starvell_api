@@ -1,3 +1,4 @@
+import asyncio
 import time
 from aiogram import Router, F
 import logging
@@ -5,20 +6,28 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-import hashlib
 
 import tg_bot_exfa.app as app
 from tg_bot_exfa.exf_langue.strings import Translations
 from tg_bot_exfa.keyboards.menus import Keyboards
 from tg_bot_exfa.states.auth import StartFlow
-from tg_bot_exfa.config import save_config
+from tg_bot_exfa.config import hash_password, password_needs_rehash, save_config, verify_password
 from tg_bot_exfa.notify import send_security_auth_success, send_security_auth_blocked
+from tg_bot_exfa.middleware import PrivateChatMiddleware
+from tg_bot_exfa.runtime import schedule_restart
 
 
 router = Router()
+router.message.outer_middleware(PrivateChatMiddleware())
 tr = Translations()
 kb = Keyboards()
 log = logging.getLogger("exfador.handlers")
+_password_work = asyncio.Semaphore(2)
+
+
+async def _run_password_work(func, *args):
+    async with _password_work:
+        return await asyncio.to_thread(func, *args)
 
 
 @router.message(CommandStart())
@@ -53,11 +62,6 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(Command("restart"))
 async def cmd_restart(message: Message):
-    import os
-    import sys
-    import asyncio
-    from pathlib import Path
-
     db = app.app_context.db
     cfg = app.app_context.config
     user = await db.get_user(message.from_user.id)
@@ -66,13 +70,7 @@ async def cmd_restart(message: Message):
     lang = user.get("language") or cfg.default_language
     m = await message.answer(tr.t(lang, "restart_start"))
 
-    async def do_exec_restart():
-        await asyncio.sleep(1)
-        root = Path(__file__).resolve().parents[2]  
-        run_path = str(root / "run_bot.py")
-        os.execv(sys.executable, [sys.executable, run_path])
-
-    asyncio.create_task(do_exec_restart())
+    schedule_restart()
     try:
         await m.edit_text(tr.t(lang, "restart_done"))
     except Exception:
@@ -91,8 +89,16 @@ async def on_password(message: Message, state: FSMContext):
         m = await message.answer(tr.t(lang, "enter_password"))
         await state.update_data(last_message_id=m.message_id)
         return
-    provided_md5 = hashlib.md5(message.text.strip().encode("utf-8")).hexdigest()
-    if provided_md5.lower() == (cfg.password_md5 or "").lower():
+    password = message.text.strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    password_valid = await _run_password_work(verify_password, password, cfg.password_md5)
+    if password_valid:
+        if password_needs_rehash(cfg.password_md5):
+            cfg.password_md5 = await _run_password_work(hash_password, password)
+            save_config(cfg)
         await db.reset_failed(message.from_user.id)
         await db.set_authorized(message.from_user.id, True)
         try:
@@ -140,9 +146,14 @@ async def on_change_password(message: Message, state: FSMContext):
     lang = user.get("language") or cfg.default_language
     data = await state.get_data()
     last_message_id = data.get("last_message_id") or message.message_id
-    new_md5 = hashlib.md5(message.text.strip().encode("utf-8")).hexdigest()
-    cfg.password_md5 = new_md5
+    password = message.text
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    cfg.password_md5 = await _run_password_work(hash_password, password)
     save_config(cfg)
+    await db.revoke_authorizations(except_user_id=message.from_user.id)
     await state.clear()
     await message.bot.edit_message_text(
         tr.t(lang, "password_changed"),
@@ -165,7 +176,8 @@ async def cmd_update(message: Message):
     lang = user.get("language") or cfg.default_language
     latest = None
     try:
-        r = requests.get(
+        r = await asyncio.to_thread(
+            requests.get,
             "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
             headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
             timeout=10,
@@ -243,5 +255,3 @@ async def cmd_logs(message: Message):
         await status_msg.delete()
     except Exception:
         pass
-
-

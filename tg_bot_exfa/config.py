@@ -1,6 +1,16 @@
 import json
 import os
 import hashlib
+import hmac
+import secrets
+import tempfile
+from pathlib import Path
+
+from tg_bot_exfa.paths import CONFIG_PATH
+
+
+PASSWORD_SCHEME = "pbkdf2_sha256"
+PASSWORD_ITERATIONS = 600_000
 
 
 class BotConfig:
@@ -33,11 +43,94 @@ class BotConfig:
 
 
 def md5_hex(text: str) -> str:
+    """Legacy hash retained only for reading old configurations."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
+def hash_password(text: str, *, iterations: int = PASSWORD_ITERATIONS, salt: str | None = None) -> str:
+    normalized = text.strip()
+    salt_value = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        normalized.encode("utf-8"),
+        salt_value.encode("ascii"),
+        int(iterations),
+    ).hex()
+    return f"{PASSWORD_SCHEME}${int(iterations)}${salt_value}${digest}"
+
+
+def verify_password(text: str, encoded: str) -> bool:
+    stored = (encoded or "").strip()
+    if not stored:
+        return False
+    if stored.startswith(f"{PASSWORD_SCHEME}$"):
+        try:
+            scheme, raw_iterations, salt, expected = stored.split("$", 3)
+            if scheme != PASSWORD_SCHEME:
+                return False
+            actual = hash_password(text, iterations=int(raw_iterations), salt=salt).rsplit("$", 1)[-1]
+            return hmac.compare_digest(actual, expected)
+        except (TypeError, ValueError):
+            return False
+    return hmac.compare_digest(md5_hex(text).lower(), stored.lower())
+
+
+def password_needs_rehash(encoded: str) -> bool:
+    stored = (encoded or "").strip()
+    if not stored.startswith(f"{PASSWORD_SCHEME}$"):
+        return True
+    try:
+        return int(stored.split("$", 3)[1]) < PASSWORD_ITERATIONS
+    except (IndexError, ValueError):
+        return True
+
+
+def _write_json_atomic(path: str | Path, data: dict) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{target.stem}-", suffix=".tmp", dir=str(target.parent), text=True)
+    try:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def update_config_values(path: str | Path, **values) -> dict:
+    target = Path(path)
+    data: dict = {}
+    if target.exists():
+        with target.open("r", encoding="utf-8") as f:
+            loaded = json.load(f) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError("Configuration root must be a JSON object")
+        data = loaded
+    data.update(values)
+    _write_json_atomic(target, data)
+    return data
+
+
 def load_config() -> BotConfig:
-    path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "config", "osnova.json"))
+    path = str(CONFIG_PATH)
     data = {}
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -47,7 +140,7 @@ def load_config() -> BotConfig:
     if not password_md5:
         plain = os.getenv("BOT_PASSWORD") or data.get("BOT_PASSWORD", "")
         if plain:
-            password_md5 = md5_hex(plain)
+            password_md5 = hash_password(plain)
     default_language = data.get("DEFAULT_LANGUAGE", "ru")
     author_username = data.get("AUTHOR_USERNAME") or os.getenv("AUTHOR_USERNAME") or "@exfador"
     channel_url = data.get("CHANNEL_URL") or os.getenv("CHANNEL_URL") or "https://t.me/starvellapi"
@@ -110,7 +203,4 @@ def save_config(cfg: BotConfig) -> None:
             "WELCOME_COOLDOWN_MINUTES": int(getattr(cfg, "welcome_cooldown_minutes", 1900)),
         }
     )
-    with open(cfg.path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-
+    _write_json_atomic(cfg.path, data)

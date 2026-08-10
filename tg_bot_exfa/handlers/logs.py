@@ -2,17 +2,24 @@ from aiogram import Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 import logging
+from tg_bot_exfa.middleware import protect_router
 
 
 router = Router()
+protect_router(router)
 log = logging.getLogger("exfador.actions")
 
 
 @router.message()
 async def log_any_message(message: Message, state: FSMContext):
     state_name = await state.get_state()
-    content = message.text if message.text is not None else f"<{message.content_type}>"
-    log.info(f"msg user_id={message.from_user.id} chat_id={message.chat.id} state={state_name} text={content}")
+    log.info(
+        "msg user_id=%s chat_id=%s state=%s content_type=%s",
+        message.from_user.id,
+        message.chat.id,
+        state_name,
+        message.content_type,
+    )
 
 
 @router.callback_query()

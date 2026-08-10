@@ -1,10 +1,9 @@
-import aiohttp
 from aiohttp import ClientResponseError
+from urllib.parse import quote
 
-from api.cookies import build_cookies, capture_cookies
-from api.http_headers import next_data_headers
+from api.http_client import request_json
 from api.next_data import get_build_id, reset_build_id
-from api.rate_limiter import throttle
+from api.response import StarvellResponseError, page_props as get_page_props
 
 
 def _maybe_int(v):
@@ -14,51 +13,70 @@ def _maybe_int(v):
         return None
 
 
+def _identifier(value):
+    numeric = _maybe_int(value)
+    if numeric is not None:
+        return numeric
+    text = str(value or "").strip()
+    return text or None
+
+
 async def find_user_lots(
     session_cookie: str,
     sid_cookie: str,
     user_id: int,
-    my_games_cookie: str | None = None,
     username: str | None = None,
+    my_games_cookie: str | None = None,
 ) -> dict:
 
-    if username:
-        referer = f"https://starvell.com/profile/{username}"
-    else:
-        referer = f"https://starvell.com/users/{user_id}"
-    headers = next_data_headers(referer)
-    cookies = build_cookies(session_cookie, sid_cookie=sid_cookie, my_games_cookie=my_games_cookie)
+    profile_name = str(username or user_id).strip()
+    if not profile_name:
+        raise ValueError("find user lots: username is missing")
+    encoded_profile_name = quote(profile_name, safe="")
 
-    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {
+        "accept": "*/*",
+        "accept-language": "ru,en;q=0.9",
+        "referer": f"https://starvell.com/profile/{encoded_profile_name}",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 YaBrowser/25.8.0.0 Safari/537.36",
+        "x-nextjs-data": "1",
+    }
+    cookies = {"session": session_cookie, "starvell.theme": "dark", "starvell.time_zone": "Europe/Moscow"}
+
+    if my_games_cookie:
+        cookies["starvell.my_games"] = my_games_cookie
+    if sid_cookie:
+        cookies["sid"] = sid_cookie
+
     last_exc = None
     data = None
     for attempt in range(2):
         build_id = await get_build_id(session_cookie)
-        if username:
-            url = f"https://starvell.com/_next/data/{build_id}/profile/{username}.json"
-        else:
-            url = f"https://starvell.com/_next/data/{build_id}/users/{user_id}.json?user_id={user_id}"
-        async with aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
-            try:
-                await throttle()
-                async with session.get(url) as resp:
-                    capture_cookies(session.cookie_jar)
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    break
-            except ClientResponseError as exc:
-                last_exc = exc
-                if exc.status == 404 and attempt == 0:
-                    reset_build_id()
-                    continue
-                raise
+        url = f"https://starvell.com/_next/data/{build_id}/profile/{encoded_profile_name}.json"
+        try:
+            data = await request_json(
+                "GET",
+                url,
+                headers=headers,
+                cookies=cookies,
+                timeout=20,
+                retry_safe=True,
+                params={"username": profile_name},
+            )
+            break
+        except ClientResponseError as exc:
+            last_exc = exc
+            if exc.status == 404 and attempt == 0:
+                reset_build_id()
+                continue
+            raise
 
     if data is None and last_exc:
         raise last_exc
     if data is None:
-        return {"lots": [], "my_games": my_games_cookie}
+        raise RuntimeError("Unable to fetch user lots")
 
-    page_props = (data or {}).get("pageProps", {})
+    page_props = get_page_props(data, "find user lots")
 
     user_profile_offers = page_props.get("userProfileOffers")
     if not user_profile_offers:
@@ -68,7 +86,7 @@ async def find_user_lots(
 
     categories = user_profile_offers or page_props.get("categoriesWithOffers") or []
     if not isinstance(categories, list):
-        return {"lots": lots, "my_games": my_games_cookie}
+        raise StarvellResponseError("find user lots: response has no category list")
 
     seen_game_ids: set[int] = set()
     for category in categories:
@@ -90,7 +108,7 @@ async def find_user_lots(
         for offer in offers:
             if not isinstance(offer, dict):
                 continue
-            offer_id = _maybe_int(offer.get("id"))
+            offer_id = _identifier(offer.get("publicId") or offer.get("id"))
             price = offer.get("price")
             availability = offer.get("availability")
             brief = (
@@ -115,5 +133,3 @@ async def find_user_lots(
     if seen_game_ids:
         derived_my_games = ",".join(str(x) for x in sorted(seen_game_ids))
     return {"lots": lots, "my_games": derived_my_games or my_games_cookie}
-
-

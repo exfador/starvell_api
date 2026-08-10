@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from tg_bot_exfa.paths import LOGS_PATH
 
 
 class _ColorFormatter(logging.Formatter):
@@ -63,9 +64,9 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     logger.addHandler(console_handler)
 
     try:
-        root_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-        logs_root = os.path.join(root_dir, "logs")
-        os.makedirs(logs_root, exist_ok=True)
+        logs_root = str(LOGS_PATH)
+        os.makedirs(logs_root, mode=0o700, exist_ok=True)
+        os.chmod(logs_root, 0o700)
 
         class _DateFolderFileHandler(logging.Handler):
             def __init__(self, logs_root_dir: str, filename: str = "bot.log", retention_days: int = 30):
@@ -121,9 +122,11 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
                             pass
                         self._stream = None
                     day_dir = os.path.join(self.logs_root_dir, new_date)
-                    os.makedirs(day_dir, exist_ok=True)
+                    os.makedirs(day_dir, mode=0o700, exist_ok=True)
+                    os.chmod(day_dir, 0o700)
                     path = os.path.join(day_dir, self.filename)
                     self._stream = open(path, mode="a", encoding="utf-8", buffering=1)
+                    os.chmod(path, 0o600)
                     self._current_date = new_date
                     self._cleanup_old()
                 except Exception:

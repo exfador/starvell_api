@@ -1,7 +1,9 @@
+import asyncio
 import html
 import logging
 import math
 import io
+import re
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -21,10 +23,21 @@ from tg_bot_exfa.states.templates import TemplatesFlow
 from tg_bot_exfa.states.orders import OrderRefund
 from tg_bot_exfa.states.autodelivery import AutodeliveryFlow
 from tg_bot_exfa.monitor import load_config as load_osnova_config
-from tg_bot_exfa.config import save_config
+from tg_bot_exfa.config import save_config, update_config_values
+from tg_bot_exfa.middleware import protect_router
+from tg_bot_exfa.paths import CONFIG_PATH, PROJECT_ROOT
+from tg_bot_exfa.runtime import schedule_restart
+from tg_bot_exfa.template_renderer import render_template
+from tg_bot_exfa.updater import (
+    apply_update_tree,
+    install_requirements_if_needed,
+    locate_repository_root,
+    safe_extract_zip,
+)
 
 
 router = Router()
+protect_router(router)
 tr = Translations()
 kb = Keyboards()
 log = logging.getLogger("exfador.handlers")
@@ -32,6 +45,37 @@ log = logging.getLogger("exfador.handlers")
 TEMPLATES_PAGE_SIZE = 5
 TEMPLATE_LIST_PREVIEW = 120
 TEMPLATE_BUTTON_PREVIEW = 40
+MAX_AUTODELIVERY_FILE_BYTES = 2_000_000
+MAX_AUTODELIVERY_LINES = 20_000
+MAX_AUTODELIVERY_ITEMS = 100_000
+MAX_AUTODELIVERY_REPEAT = 10_000
+MAX_CHAT_IMAGE_BYTES = 10_000_000
+
+
+def _parse_autodelivery_values(raw: str) -> list[str]:
+    lines = raw.splitlines()
+    if len(lines) > MAX_AUTODELIVERY_LINES:
+        raise ValueError("too many lines")
+    parsed: list[tuple[str, int]] = []
+    total = 0
+    for line in lines:
+        value = (line or "").strip()
+        if not value:
+            continue
+        count = 1
+        left, separator, right = value.rpartition(":")
+        if separator and right.strip().isdigit():
+            count = int(right.strip())
+            value = left.strip()
+        if not value:
+            continue
+        if count < 1 or count > MAX_AUTODELIVERY_REPEAT:
+            raise ValueError("invalid repeat count")
+        total += count
+        if total > MAX_AUTODELIVERY_ITEMS:
+            raise ValueError("too many inventory items")
+        parsed.append((value, count))
+    return [value for value, count in parsed for _ in range(count)]
 
 
 def _preview_text(text: str | None, limit: int) -> str:
@@ -124,13 +168,19 @@ async def _send_reply_from_state(
         my_games_cookie = (auth or {}).get("my_games")
         if not my_games_cookie:
             uid = ((auth or {}).get("user") or {}).get("id")
-            uname = ((auth or {}).get("user") or {}).get("username")
             try:
                 uid_int = int(uid)
             except Exception:
                 uid_int = None
             if uid_int:
-                lots_data = await find_user_lots(session_cookie, sid_cookie or "", uid_int, username=uname)
+                auth_user = (auth or {}).get("user") or {}
+                username = auth_user.get("username") or auth_user.get("login")
+                lots_data = await find_user_lots(
+                    session_cookie,
+                    sid_cookie or "",
+                    uid_int,
+                    username=username,
+                )
                 my_games_cookie = (lots_data or {}).get("my_games") or my_games_cookie
     except Exception:
         sid_cookie = None
@@ -230,13 +280,19 @@ async def _send_reply_image_from_state(
         my_games_cookie = (auth or {}).get("my_games")
         if not my_games_cookie:
             uid = ((auth or {}).get("user") or {}).get("id")
-            uname = ((auth or {}).get("user") or {}).get("username")
             try:
                 uid_int = int(uid)
             except Exception:
                 uid_int = None
             if uid_int:
-                lots_data = await find_user_lots(session_cookie, sid_cookie or "", uid_int, username=uname)
+                auth_user = (auth or {}).get("user") or {}
+                username = auth_user.get("username") or auth_user.get("login")
+                lots_data = await find_user_lots(
+                    session_cookie,
+                    sid_cookie or "",
+                    uid_int,
+                    username=username,
+                )
                 my_games_cookie = (lots_data or {}).get("my_games") or my_games_cookie
     except Exception:
         sid_cookie = None
@@ -255,12 +311,23 @@ async def _send_reply_image_from_state(
             image_bytes=image_bytes,
             filename=filename,
             content_type=content_type,
-            content=caption,
+            content=None,
             sid_cookie=sid_cookie,
             my_games_cookie=my_games_cookie,
         )
     except Exception as exc:
         return False, str(exc), chat_id
+    caption_error = None
+    if caption:
+        try:
+            await send_chat_message(
+                session_cookie,
+                chat_id,
+                caption,
+                my_games_cookie=my_games_cookie,
+            )
+        except Exception as exc:
+            caption_error = str(exc)
     notification_chat_id = data.get("notification_chat_id") or default_chat_id
     notification_message_id = data.get("notification_message_id") or default_message_id
     original_kind = data.get("original_kind") or "text"
@@ -310,7 +377,7 @@ async def _send_reply_image_from_state(
             exc,
         )
     await state.clear()
-    return True, None, chat_id
+    return True, caption_error, chat_id
 
 
 async def _lang_of(user, cfg):
@@ -604,11 +671,8 @@ async def _show_template_selection(
 @router.callback_query(F.data.startswith("lang:"), StartFlow.choosing_language)
 async def choose_language(callback: CallbackQuery, state: FSMContext):
     db = app.app_context.db
-    cfg = app.app_context.config
-    user = await db.get_user(callback.from_user.id)
     lang_code = callback.data.split(":", 1)[1]
     await db.set_language(callback.from_user.id, lang_code)
-    lang = await _lang_of(user, cfg)
     await callback.message.edit_text(tr.t(lang_code, "main_menu"), reply_markup=kb.main_menu(lambda k: tr.t(lang_code, k)).as_markup())
     await state.clear()
     await callback.answer()
@@ -630,8 +694,6 @@ async def open_language(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("lang:"))
 async def choose_language_any(callback: CallbackQuery, state: FSMContext):
     db = app.app_context.db
-    cfg = app.app_context.config
-    user = await db.get_user(callback.from_user.id)
     lang_code = callback.data.split(":", 1)[1]
     await db.set_language(callback.from_user.id, lang_code)
     await callback.message.edit_text(tr.t(lang_code, "main_menu"), reply_markup=kb.main_menu(lambda k: tr.t(lang_code, k)).as_markup())
@@ -712,10 +774,7 @@ async def open_prefix(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "prefix:toggle")
 async def toggle_prefix(callback: CallbackQuery, state: FSMContext):
-    db = app.app_context.db
     cfg = app.app_context.config
-    user = await db.get_user(callback.from_user.id)
-    lang = await _lang_of(user, cfg)
     current = bool(getattr(cfg, "watermark_on", True))
     setattr(cfg, "watermark_on", not current)
     save_config(cfg)
@@ -725,10 +784,7 @@ async def toggle_prefix(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "welcome:toggle")
 async def toggle_welcome(callback: CallbackQuery, state: FSMContext):
-    db = app.app_context.db
     cfg = app.app_context.config
-    user = await db.get_user(callback.from_user.id)
-    lang = await _lang_of(user, cfg)
     current = bool(getattr(cfg, "welcome_enabled", True))
     setattr(cfg, "welcome_enabled", not current)
     save_config(cfg)
@@ -979,9 +1035,6 @@ async def cancel_change(callback: CallbackQuery, state: FSMContext):
 
 @router.message(StartFlow.changing_session, F.text)
 async def on_change_session(message: Message, state: FSMContext):
-    import json
-    from pathlib import Path
-
     db = app.app_context.db
     cfg = app.app_context.config
     user = await db.get_user(message.from_user.id)
@@ -989,6 +1042,10 @@ async def on_change_session(message: Message, state: FSMContext):
     data = await state.get_data()
     last_message_id = data.get("last_message_id") or message.message_id
     new_session = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
     if not new_session:
         await message.bot.edit_message_text(
             tr.t(lang, "session_change_failed", error="empty"),
@@ -999,17 +1056,10 @@ async def on_change_session(message: Message, state: FSMContext):
         await state.clear()
         return
     try:
-        cfg_path = Path("config/osnova.json")
-        obj = {}
-        if cfg_path.exists():
-            obj = json.loads(cfg_path.read_text(encoding="utf-8") or "{}")
-        obj["SESSION_COOKIE"] = new_session
-        cfg_path.write_text(json.dumps(obj, ensure_ascii=False, indent=4), encoding="utf-8")
-        try:
-            from api.cookies import reset_dynamic_cookies
-            reset_dynamic_cookies()
-        except Exception:
-            pass
+        auth = await fetch_homepage_data(new_session)
+        if not (auth.get("authorized") and auth.get("user")):
+            raise ValueError("Starvell rejected this session")
+        update_config_values(CONFIG_PATH, SESSION_COOKIE=new_session)
     except Exception as exc:
         await message.bot.edit_message_text(
             tr.t(lang, "session_change_failed", error=str(exc)),
@@ -1019,17 +1069,15 @@ async def on_change_session(message: Message, state: FSMContext):
         )
         await state.clear()
         return
+    account = auth.get("user") or {}
+    account_name = html.escape(str(account.get("username") or account.get("id") or "-"))
     await message.bot.edit_message_text(
-        tr.t(lang, "session_changed"),
+        f"{tr.t(lang, 'session_changed')}\nStarvell: <code>{account_name}</code>",
         chat_id=message.chat.id,
         message_id=last_message_id,
         reply_markup=kb.settings_menu(lambda k: tr.t(lang, k)).as_markup(),
     )
     await state.clear()
-    try:
-        await message.delete()
-    except Exception:
-        pass
     log.info("session_updated user_id=%s", message.from_user.id)
 
 
@@ -1042,6 +1090,10 @@ async def on_change_token(message: Message, state: FSMContext):
     data = await state.get_data()
     last_message_id = data.get("last_message_id") or message.message_id
     new_token = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
     if not new_token:
         await message.bot.edit_message_text(
             tr.t(lang, "token_change_failed", error="empty"),
@@ -1052,9 +1104,20 @@ async def on_change_token(message: Message, state: FSMContext):
         await state.clear()
         return
     try:
-        from tg_bot_exfa.config import save_config
+        from aiogram import Bot
+
+        probe = Bot(token=new_token)
+        try:
+            await probe.get_me()
+        finally:
+            await probe.session.close()
+        previous_token = cfg.token
         cfg.token = new_token
-        save_config(cfg)
+        try:
+            save_config(cfg)
+        except Exception:
+            cfg.token = previous_token
+            raise
     except Exception as exc:
         await message.bot.edit_message_text(
             tr.t(lang, "token_change_failed", error=str(exc)),
@@ -1065,17 +1128,14 @@ async def on_change_token(message: Message, state: FSMContext):
         await state.clear()
         return
     await message.bot.edit_message_text(
-        tr.t(lang, "token_changed"),
+        f"{tr.t(lang, 'token_changed')}\nПерезапускаю бота…",
         chat_id=message.chat.id,
         message_id=last_message_id,
         reply_markup=kb.settings_menu(lambda k: tr.t(lang, k)).as_markup(),
     )
     await state.clear()
-    try:
-        await message.delete()
-    except Exception:
-        pass
     log.info("token_updated user_id=%s", message.from_user.id)
+    schedule_restart(1.5)
 
 
 @router.callback_query(F.data == "menu:notifications")
@@ -1360,7 +1420,6 @@ async def ad_on_name(message: Message, state: FSMContext):
 
 @router.message(AutodeliveryFlow.waiting_file, F.document)
 async def ad_on_file(message: Message, state: FSMContext):
-    import io
     db = app.app_context.db
     cfg = app.app_context.config
     user = await db.get_user(message.from_user.id)
@@ -1381,6 +1440,9 @@ async def ad_on_file(message: Message, state: FSMContext):
             ),
         )
         return
+    if int(message.document.file_size or 0) > MAX_AUTODELIVERY_FILE_BYTES:
+        await message.answer("Файл слишком большой.")
+        return
     buf = io.BytesIO()
     try:
         await message.bot.download(message.document, destination=buf)
@@ -1396,24 +1458,15 @@ async def ad_on_file(message: Message, state: FSMContext):
             ),
         )
         return
-    raw = buf.getvalue().decode("utf-8", errors="ignore")
-    values: list[str] = []
-    for line in raw.splitlines():
-        s = (line or "").strip()
-        if not s:
-            continue
-        if ":" in s:
-            left, right = s.split(":", 1)
-            left = left.strip()
-            try:
-                count = int((right or "").strip())
-            except Exception:
-                count = 1
-            for _ in range(max(0, count)):
-                if left:
-                    values.append(left)
-        else:
-            values.append(s)
+    if buf.tell() > MAX_AUTODELIVERY_FILE_BYTES:
+        await message.answer("Файл слишком большой.")
+        return
+    try:
+        raw = buf.getvalue().decode("utf-8", errors="strict")
+        values = _parse_autodelivery_values(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        await message.answer(f"Файл отклонён: {html.escape(str(exc))}")
+        return
     added = await db.add_autodelivery_items(name, values)
     if return_item_id:
         left = await db.count_autodelivery(name)
@@ -1627,7 +1680,8 @@ async def open_info(callback: CallbackQuery):
     latest = "—"
     try:
         import requests 
-        r = requests.get(
+        r = await asyncio.to_thread(
+            requests.get,
             "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
             headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
             timeout=5,
@@ -2026,7 +2080,12 @@ async def pick_template(callback: CallbackQuery, state: FSMContext):
         page_index = data.get("template_page", 0)
         await _show_template_selection(callback, state, lang, page_index)
         return
-    content = template.get("content") or ""
+    content = render_template(
+        template.get("content") or "",
+        {
+            "chat_id": chat_id,
+        },
+    )
     default_chat_id = data.get("notification_chat_id") or callback.message.chat.id
     default_message_id = data.get("notification_message_id")
     success, error, sent_chat_id = await _send_reply_from_state(
@@ -2161,11 +2220,17 @@ async def handle_chat_reply_photo(message: Message, state: FSMContext):
         await message.answer(tr.t(lang, "reply_prompt"))
         return
     best = photos[-1]
+    if int(getattr(best, "file_size", 0) or 0) > MAX_CHAT_IMAGE_BYTES:
+        await message.answer(tr.t(lang, "reply_failed", error="image is too large"))
+        return
     buf = io.BytesIO()
     try:
         await message.bot.download(best, destination=buf)
     except Exception as exc:
         await message.answer(tr.t(lang, "reply_failed", error=str(exc)))
+        return
+    if buf.tell() > MAX_CHAT_IMAGE_BYTES:
+        await message.answer(tr.t(lang, "reply_failed", error="image is too large"))
         return
     caption = None
     if message.caption:
@@ -2188,7 +2253,10 @@ async def handle_chat_reply_photo(message: Message, state: FSMContext):
         user_id=message.from_user.id,
     )
     if success:
-        await message.answer(tr.t(lang, "reply_sent"))
+        if error:
+            await message.answer(tr.t(lang, "reply_image_caption_failed", error=str(error)))
+        else:
+            await message.answer(tr.t(lang, "reply_sent"))
         log.info("chat_reply_image_sent user_id=%s chat_id=%s", message.from_user.id, sent_chat_id)
     else:
         await message.answer(tr.t(lang, "reply_failed", error=str(error)))
@@ -2214,11 +2282,17 @@ async def handle_chat_reply_document(message: Message, state: FSMContext):
     if not mime.startswith("image/"):
         await message.answer(tr.t(lang, "reply_failed", error="unsupported file type"))
         return
+    if int(getattr(doc, "file_size", 0) or 0) > MAX_CHAT_IMAGE_BYTES:
+        await message.answer(tr.t(lang, "reply_failed", error="image is too large"))
+        return
     buf = io.BytesIO()
     try:
         await message.bot.download(doc, destination=buf)
     except Exception as exc:
         await message.answer(tr.t(lang, "reply_failed", error=str(exc)))
+        return
+    if buf.tell() > MAX_CHAT_IMAGE_BYTES:
+        await message.answer(tr.t(lang, "reply_failed", error="image is too large"))
         return
     caption = None
     if message.caption:
@@ -2274,13 +2348,9 @@ async def back_main(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("update:install:"))
 async def install_update(callback: CallbackQuery):
-    import asyncio
     import aiohttp
     import tempfile
-    import zipfile
     import shutil
-    import hashlib
-    import os
     from pathlib import Path
     db = app.app_context.db
     user = await db.get_user(callback.from_user.id)
@@ -2292,6 +2362,9 @@ async def install_update(callback: CallbackQuery):
         await callback.answer()
         return
     tag_name = parts[2]
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", tag_name):
+        await callback.answer("Некорректная версия", show_alert=True)
+        return
     try:
         await callback.message.edit_text(f"Скачиваю обновление {tag_name}…")
     except Exception:
@@ -2299,7 +2372,8 @@ async def install_update(callback: CallbackQuery):
     zip_url = None
     try:
         import requests
-        r = requests.get(
+        r = await asyncio.to_thread(
+            requests.get,
             "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
             headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
             timeout=10,
@@ -2314,104 +2388,61 @@ async def install_update(callback: CallbackQuery):
     if not zip_url:
         await callback.answer("Не удалось получить ссылку", show_alert=True)
         return
-    root = Path(__file__).resolve().parents[2]
-    api_dir = root / "api"
     tmp_dir = Path(tempfile.mkdtemp(prefix="upd_"))
     zip_path = tmp_dir / "repo.zip"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(zip_url) as resp:
-            if resp.status != 200:
-                await callback.answer("Скачивание не удалось", show_alert=True)
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                return
-            with open(zip_path, "wb") as f:
-                while True:
-                    chunk = await resp.content.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+    max_archive_bytes = 100_000_000
     try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(tmp_dir)
+        timeout = aiohttp.ClientTimeout(total=120, connect=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(zip_url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"download HTTP {resp.status}")
+                if int(resp.content_length or 0) > max_archive_bytes:
+                    raise RuntimeError("archive is too large")
+                downloaded = 0
+                with zip_path.open("wb") as archive_file:
+                    while True:
+                        chunk = await resp.content.read(65536)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        if downloaded > max_archive_bytes:
+                            raise RuntimeError("archive is too large")
+                        archive_file.write(chunk)
+        extracted_dir = tmp_dir / "extracted"
+        extracted_dir.mkdir()
+        await asyncio.to_thread(safe_extract_zip, zip_path, extracted_dir)
+        repo_root = locate_repository_root(extracted_dir)
+        await asyncio.to_thread(install_requirements_if_needed, repo_root, PROJECT_ROOT)
+        changes = await asyncio.to_thread(apply_update_tree, repo_root, PROJECT_ROOT)
     except Exception as exc:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        await callback.answer("Распаковка не удалась", show_alert=True)
+        log.exception("update_install_failed tag=%s", tag_name)
+        try:
+            await callback.message.edit_text(f"Обновление не установлено: {html.escape(str(exc))}")
+        except Exception:
+            pass
+        await callback.answer("Обновление отменено без частичной замены", show_alert=True)
         return
-    extracted_roots = [p for p in tmp_dir.iterdir() if p.is_dir()]
-    if extracted_roots:
-        repo_root = extracted_roots[0]
-    else:
-        repo_root = tmp_dir
-    remote_api = repo_root / "api"
-    if not remote_api.exists():
-        remote_api = repo_root
-    changes_new: list[str] = []
-    changes_updated: list[str] = []
-    changes_deleted: list[str] = []
-    def _hash(path: Path) -> str:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    remote_files: list[Path] = []
-    for base, _dirs, files in os.walk(remote_api):
-        for name in files:
-            remote_files.append(Path(base) / name)
-    local_files_map: dict[str, Path] = {}
-    for base, _dirs, files in os.walk(api_dir):
-        for name in files:
-            rel = str((Path(base) / name).relative_to(api_dir)).replace("\\", "/")
-            local_files_map[rel] = Path(base) / name
-    remote_rel_map: dict[str, Path] = {}
-    for f in remote_files:
-        rel = str(f.relative_to(remote_api)).replace("\\", "/")
-        remote_rel_map[rel] = f
-    for rel, src in remote_rel_map.items():
-        dst = api_dir / rel
-        if not dst.exists():
-            changes_new.append(rel)
-        else:
-            try:
-                if _hash(src) != _hash(dst):
-                    changes_updated.append(rel)
-            except Exception:
-                changes_updated.append(rel)
-    for rel in local_files_map.keys():
-        if rel not in remote_rel_map:
-            changes_deleted.append(rel)
-
-    try:
-        if api_dir.exists():
-            shutil.rmtree(api_dir, ignore_errors=True)
-        api_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(remote_api, api_dir, dirs_exist_ok=True)
-    except Exception as exc:
-        await callback.answer("Ошибка замены файлов", show_alert=True)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return
-    try:
-        with open(root / "version.py", "w", encoding="utf-8") as vf:
-            vf.write(f"VERSION = \"{tag_name}\"\n")
-    except Exception:
-        pass
     shutil.rmtree(tmp_dir, ignore_errors=True)
     try:
         lines = [
             f"Обновление установлено: {tag_name}",
-            f"Новые: {len(changes_new)} | Обновлены: {len(changes_updated)} | Удалены: {len(changes_deleted)}",
+            f"Новые: {len(changes['new'])} | Обновлены: {len(changes['updated'])} | Удалены: {len(changes['deleted'])}",
+            "Перезапускаю бота…",
         ]
         await callback.message.edit_text("\n".join(lines))
     except Exception:
         pass
     try:
         ulog = logging.getLogger("exfador.update")
-        for x in sorted(set(changes_new)):
+        for x in changes["new"]:
             ulog.info(f"NEW {x}")
-        for x in sorted(set(changes_updated)):
+        for x in changes["updated"]:
             ulog.info(f"UPDATED {x}")
-        for x in sorted(set(changes_deleted)):
+        for x in changes["deleted"]:
             ulog.info(f"DELETED {x}")
     except Exception:
         pass
     await callback.answer()
+    schedule_restart(1.5)

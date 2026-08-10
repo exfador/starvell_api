@@ -1,0 +1,12 @@
+services:
+  starvell-bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      STARVELL_DATA_DIR: /data
+      TZ: Europe/Moscow
+    volumes:
+      - ./data:/data
+    stdin_open: true
+    tty: true

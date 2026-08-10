@@ -1,0 +1,25 @@
+[Unit]
+Description=Starvell Telegram automation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=starvell
+Group=starvell
+WorkingDirectory=/opt/starvell_api
+Environment=PYTHONUNBUFFERED=1
+Environment=STARVELL_DATA_DIR=/var/lib/starvell-bot
+EnvironmentFile=-/etc/starvell-bot.env
+ExecStart=/opt/starvell_api/.venv/bin/python /opt/starvell_api/run_bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/starvell-bot
+
+[Install]
+WantedBy=multi-user.target

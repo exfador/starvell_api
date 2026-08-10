@@ -40,12 +40,15 @@ class PluginManager:
 		self.disabled: set[str] = set()
 		self.commands: dict[str, dict[str, Any]] = {}
 		self._logger = logging.getLogger("exfador.plugins")
+		self.hook_timeout = 10.0
+		self._hook_semaphore = asyncio.Semaphore(8)
+		self._reserved_commands = {"start", "restart", "update", "logs"}
 
 	def _ensure_dirs(self) -> None:
-		os.makedirs(self.root_dir, exist_ok=True)
+		os.makedirs(self.root_dir, mode=0o700, exist_ok=True)
 		state_dir = os.path.dirname(self.state_path)
 		if state_dir:
-			os.makedirs(state_dir, exist_ok=True)
+			os.makedirs(state_dir, mode=0o700, exist_ok=True)
 		try:
 			abs_plugins = os.path.abspath(self.root_dir)
 			if abs_plugins not in sys.path:
@@ -70,9 +73,20 @@ class PluginManager:
 		self._ensure_dirs()
 		data = {"disabled": sorted(self.disabled)}
 		tmp_path = self.state_path + ".tmp"
-		with open(tmp_path, "w", encoding="utf-8") as f:
-			json.dump(data, f, ensure_ascii=False, indent=2)
-		os.replace(tmp_path, self.state_path)
+		try:
+			with open(tmp_path, "w", encoding="utf-8") as f:
+				os.chmod(tmp_path, 0o600)
+				json.dump(data, f, ensure_ascii=False, indent=2)
+				f.flush()
+				os.fsync(f.fileno())
+			os.replace(tmp_path, self.state_path)
+			os.chmod(self.state_path, 0o600)
+		finally:
+			if os.path.exists(tmp_path):
+				try:
+					os.unlink(tmp_path)
+				except OSError:
+					pass
 
 	def _import_module_from_file(self, file_path: str) -> ModuleType:
 		try:
@@ -189,6 +203,18 @@ class PluginManager:
 					continue
 				if not name or not callable(handler):
 					continue
+				if name in self._reserved_commands:
+					self._logger.warning("reserved_plugin_command command=%s uuid=%s", name, uuid)
+					continue
+				existing = self.commands.get(name)
+				if existing and existing.get("uuid") != uuid:
+					self._logger.warning(
+						"duplicate_plugin_command command=%s rejected_uuid=%s owner_uuid=%s",
+						name,
+						uuid,
+						existing.get("uuid"),
+					)
+					continue
 				self.commands[name] = {"uuid": uuid, "handler": handler, "description": desc}
 			except Exception:
 				continue
@@ -224,16 +250,11 @@ class PluginManager:
 		meta = self.commands.get(name.lower())
 		if not meta:
 			return None
-		handler = meta.get("handler")
-		try:
-			if asyncio.iscoroutinefunction(handler):
-				return await handler(message, args, ctx)
-			res = handler(message, args, ctx)
-			if asyncio.iscoroutine(res):
-				return await res
-			return res
-		except Exception:
+		plugin = self.plugins.get(str(meta.get("uuid") or ""))
+		if not plugin or not plugin.enabled:
 			return None
+		handler = meta.get("handler")
+		return await self._maybe_call(handler, message, args, ctx)
 
 	def load_all(self) -> None:
 		self._load_state()
@@ -249,6 +270,25 @@ class PluginManager:
 				continue
 			full = os.path.join(self.root_dir, file)
 			try:
+				meta_text = self._extract_meta_text(full)
+				known_uuid = meta_text.get("UUID")
+				if known_uuid and known_uuid in self.disabled:
+					if known_uuid in self.plugins:
+						self._logger.error("duplicate_uuid uuid=%s skip_file=%s", known_uuid, full)
+						continue
+					self.plugins[known_uuid] = PluginMeta(
+						meta_text.get("NAME") or file,
+						known_uuid,
+						meta_text.get("VERSION") or "unknown",
+						meta_text.get("DESCRIPTION") or "",
+						meta_text.get("CREDITS"),
+						full,
+						None,
+						False,
+						None,
+					)
+					self._logger.info("plugin_disabled_skip_import uuid=%s path=%s", known_uuid, full)
+					continue
 				module = self._import_module_from_file(full)
 				name, uuid, version, description, credits = self._validate_module(module)
 				if uuid in self.plugins:
@@ -260,8 +300,9 @@ class PluginManager:
 					continue
 				enabled = uuid not in self.disabled
 				self.plugins[uuid] = PluginMeta(name, uuid, version, description, credits, full, module, enabled, None)
-				self._register_commands_for_module(module, uuid)
-				self._register_handlers_for_module(module, uuid)
+				if enabled:
+					self._register_commands_for_module(module, uuid)
+					self._register_handlers_for_module(module, uuid)
 				try:
 					self._logger.info("plugin_loaded name=%s version=%s uuid=%s enabled=%s path=%s", name, version, uuid, enabled, full)
 				except Exception:
@@ -309,8 +350,9 @@ class PluginManager:
 		enabled = uuid not in self.disabled
 		meta = PluginMeta(name, uuid, version, description, credits, file_path, module, enabled, None)
 		self.plugins[uuid] = meta
-		self._register_commands_for_module(module, uuid)
-		self._register_handlers_for_module(module, uuid)
+		if enabled:
+			self._register_commands_for_module(module, uuid)
+			self._register_handlers_for_module(module, uuid)
 		try:
 			self._logger.info("plugin_loaded name=%s version=%s uuid=%s enabled=%s path=%s", name, version, uuid, enabled, file_path)
 		except Exception:
@@ -322,9 +364,32 @@ class PluginManager:
 			self.disabled.remove(uuid)
 			self._save_state()
 		if uuid in self.plugins:
-			self.plugins[uuid].enabled = True
+			meta = self.plugins[uuid]
+			if meta.module is None and meta.load_error is None:
+				try:
+					module = self._import_module_from_file(meta.path)
+					name, loaded_uuid, version, description, credits = self._validate_module(module)
+					if loaded_uuid != uuid:
+						raise ValueError("plugin UUID changed while disabled")
+					meta.name = name
+					meta.version = version
+					meta.description = description
+					meta.credits = credits
+					meta.module = module
+				except Exception as exc:
+					meta.load_error = str(exc)
+					meta.enabled = False
+					self.disabled.add(uuid)
+					self._save_state()
+					return False
+			meta.enabled = meta.module is not None
+			if not meta.enabled:
+				return False
+			self._unregister_commands_by_uuid(uuid)
+			self._unregister_handlers_by_uuid(uuid)
 			try:
-				self._register_commands_for_module(self.plugins[uuid].module, uuid)
+				self._register_commands_for_module(meta.module, uuid)
+				self._register_handlers_for_module(meta.module, uuid)
 			except Exception:
 				pass
 			try:
@@ -341,6 +406,7 @@ class PluginManager:
 		if uuid in self.plugins:
 			self.plugins[uuid].enabled = False
 			self._unregister_commands_by_uuid(uuid)
+			self._unregister_handlers_by_uuid(uuid)
 			try:
 				meta = self.plugins[uuid]
 				self._logger.info("plugin_disabled name=%s version=%s uuid=%s", meta.name, meta.version, uuid)
@@ -368,14 +434,21 @@ class PluginManager:
 		return True
 
 	async def _maybe_call(self, fn, *args, **kwargs):
+		if not callable(fn):
+			return None
 		try:
-			if asyncio.iscoroutinefunction(fn):
-				return await fn(*args, **kwargs)
-			res = fn(*args, **kwargs)
-			if asyncio.iscoroutine(res):
-				return await res
-			return res
-		except Exception:
+			async with self._hook_semaphore:
+				async with asyncio.timeout(self.hook_timeout):
+					if asyncio.iscoroutinefunction(fn):
+						return await fn(*args, **kwargs)
+					res = await asyncio.to_thread(fn, *args, **kwargs)
+					if asyncio.iscoroutine(res):
+						return await res
+					return res
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			self._logger.warning("plugin_hook_failed hook=%s error=%s", getattr(fn, "__name__", "unknown"), exc)
 			return None
 
 	async def dispatch_init(self, ctx: PluginContext) -> None:

@@ -1,13 +1,11 @@
 import asyncio
-import os
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 
 import tg_bot_exfa.app as app
-from tg_bot_exfa.config import load_config, save_config, md5_hex
+from tg_bot_exfa.config import hash_password, load_config, save_config, update_config_values
 from tg_bot_exfa.storage.db import Database
 from tg_bot_exfa.handlers.start import router as start_router
 from tg_bot_exfa.handlers.callbacks import router as callbacks_router
@@ -15,10 +13,12 @@ from tg_bot_exfa.handlers.plugins import router as plugins_router
 from tg_bot_exfa.handlers.plugin_cmds import router as plugin_cmds_router
 from tg_bot_exfa.monitor import start_monitor, load_config as load_osnova_config
 from api.auth import fetch_homepage_data
+from api.http_client import close_http_session
 from tg_bot_exfa.logger import setup_logging
 from tg_bot_exfa.handlers.logs import router as logs_router
 from tg_bot_exfa.plugins import PluginManager, PluginContext
-from pathlib import Path
+from tg_bot_exfa.paths import DATABASE_PATH, PLUGINS_PATH, PLUGIN_STATE_PATH
+from tg_bot_exfa.storage.fsm import SQLiteStorage
 
 
 async def run_bot() -> None:
@@ -29,8 +29,8 @@ async def run_bot() -> None:
         print("Bot configuration is incomplete. Setup is required.")
         token = cfg.token or input("Enter BOT_TOKEN: ").strip()
         if not cfg.password_md5:
-            plain = input("Enter bot password (will be stored as MD5): ").strip()
-            password_md5 = md5_hex(plain)
+            plain = input("Enter bot password: ").strip()
+            password_md5 = hash_password(plain)
         else:
             password_md5 = cfg.password_md5
         lang = (cfg.default_language or "ru").strip() or "ru"
@@ -39,33 +39,31 @@ async def run_bot() -> None:
         cfg.default_language = lang
         save_config(cfg)
         try:
-            from pathlib import Path
-            import json
             session_cookie = input("Enter SESSION_COOKIE (optional, press Enter to skip): ").strip()
             if session_cookie:
-                cfg_path = Path(cfg.path)
-                obj = {}
-                if cfg_path.exists():
-                    try:
-                        obj = json.loads(cfg_path.read_text(encoding="utf-8") or "{}")
-                    except Exception:
-                        obj = {}
-                obj["SESSION_COOKIE"] = session_cookie
-                cfg_path.write_text(json.dumps(obj, ensure_ascii=False, indent=4), encoding="utf-8")
+                update_config_values(cfg.path, SESSION_COOKIE=session_cookie)
         except Exception:
             pass
-    db_path = os.path.join(os.path.dirname(__file__), "bot.sqlite3")
-    db = Database(db_path)
+    db = Database(str(DATABASE_PATH))
     await db.init()
+    try:
+        pruned = await db.prune_runtime_state(retention_days=180)
+        if any(pruned.values()):
+            logging.getLogger("exfador.bot").info("Pruned runtime history: %s", pruned)
+    except Exception as exc:
+        logging.getLogger("exfador.bot").warning("Runtime history cleanup failed: %s", exc)
     app.app_context = app.AppContext(cfg, db)
     bot = Bot(token=cfg.token, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher(storage=MemoryStorage())
+    app.app_context.bot = bot
+    fsm_storage = SQLiteStorage(DATABASE_PATH)
+    await fsm_storage.init()
+    dp = Dispatcher(storage=fsm_storage)
     try:
-        Path("plugins").mkdir(parents=True, exist_ok=True)
-        Path("storage/plugins").mkdir(parents=True, exist_ok=True)
+        PLUGINS_PATH.mkdir(parents=True, exist_ok=True)
+        PLUGIN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
-    pm = PluginManager(root_dir="plugins", state_path="storage/plugins/state.json")
+    pm = PluginManager(root_dir=str(PLUGINS_PATH), state_path=str(PLUGIN_STATE_PATH))
     pm.load_all()
     app.app_context.plugin_manager = pm
     try:
@@ -112,7 +110,7 @@ async def run_bot() -> None:
         except Exception as e:
             log.warning("Failed to set long description: %s", e)
         try:
-            current = await bot.get_my_short_description()
+            await bot.get_my_short_description()
         except Exception as e:
             log.warning("Unable to read back short description: %s", e)
     except Exception as e:
@@ -177,7 +175,14 @@ async def run_bot() -> None:
     mt = asyncio.create_task(start_monitor())
     app.app_context.monitor_task = mt
     log.info("Polling started")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if not mt.done():
+            mt.cancel()
+        await asyncio.gather(mt, return_exceptions=True)
+        await close_http_session()
+        await bot.session.close()
 
 
 def main() -> None:
@@ -186,5 +191,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

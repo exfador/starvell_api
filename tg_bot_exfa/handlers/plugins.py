@@ -1,9 +1,12 @@
 import os
 import asyncio
+import sys
+import tempfile
+import html
+from pathlib import Path
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, LinkPreviewOptions
-from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, BotCommand, LinkPreviewOptions
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import tg_bot_exfa.app as app
@@ -11,11 +14,15 @@ from tg_bot_exfa.exf_langue.strings import Translations
 from tg_bot_exfa.keyboards.menus import Keyboards
 from tg_bot_exfa.states.plugins import PluginsFlow
 from tg_bot_exfa.plugins import PluginContext
+from tg_bot_exfa.middleware import protect_router
+from tg_bot_exfa.paths import PLUGINS_PATH
 
 
 router = Router()
+protect_router(router)
 tr = Translations()
 kb = Keyboards()
+MAX_PLUGIN_BYTES = 1_000_000
 
 
 @router.callback_query(F.data == "menu:plugins")
@@ -58,6 +65,62 @@ def _safe_file_name(name: str) -> str:
 	return file
 
 
+async def _stage_and_load_plugin(bot, document, plugin_manager):
+	file_name = str(getattr(document, "file_name", "") or "")
+	if not file_name.lower().endswith(".py"):
+		raise ValueError("wrong file")
+	declared_size = int(getattr(document, "file_size", 0) or 0)
+	if declared_size < 0 or declared_size > MAX_PLUGIN_BYTES:
+		raise ValueError("file is too large")
+
+	PLUGINS_PATH.mkdir(parents=True, exist_ok=True)
+	dest_name = _safe_file_name(file_name or "plugin.py")
+	dest_path = PLUGINS_PATH / dest_name
+	if dest_path.exists():
+		raise ValueError("plugin filename already exists")
+
+	remote_file = await bot.get_file(document.file_id)
+	meta = None
+	with tempfile.TemporaryDirectory(prefix=".plugin-upload-", dir=str(PLUGINS_PATH.parent)) as staging_dir:
+		staged_path = Path(staging_dir) / dest_name
+		staging_root = os.path.abspath(staging_dir)
+		await bot.download_file(remote_file.file_path, destination=str(staged_path))
+		if not staged_path.is_file():
+			raise RuntimeError("plugin download failed")
+		if staged_path.stat().st_size > MAX_PLUGIN_BYTES:
+			raise ValueError("file is too large")
+
+		source = staged_path.read_bytes()
+		compile(source, dest_name, "exec")
+		meta_text = plugin_manager._extract_meta_text(str(staged_path))
+		known_uuid = meta_text.get("UUID")
+		if known_uuid and known_uuid in plugin_manager.plugins:
+			raise ValueError(f"Duplicate UUID: {known_uuid}")
+
+		try:
+			meta = plugin_manager.load_one(str(staged_path))
+			if meta.module is None or meta.load_error:
+				raise RuntimeError(meta.load_error or "plugin failed to load")
+			if dest_path.exists():
+				raise ValueError("plugin filename already exists")
+			os.replace(staged_path, dest_path)
+			meta.path = str(dest_path)
+			try:
+				meta.module.__file__ = str(dest_path)
+				if getattr(meta.module, "__spec__", None) is not None:
+					meta.module.__spec__.origin = str(dest_path)
+			except (AttributeError, TypeError):
+				pass
+			return meta
+		except Exception:
+			if meta is not None and plugin_manager.plugins.get(meta.uuid) is meta:
+				plugin_manager.remove(meta.uuid)
+			raise
+		finally:
+			while staging_root in sys.path:
+				sys.path.remove(staging_root)
+
+
 @router.message(PluginsFlow.waiting_upload, F.document)
 async def handle_plugin_upload(message: Message, state: FSMContext):
 	cfg = app.app_context.config
@@ -68,17 +131,14 @@ async def handle_plugin_upload(message: Message, state: FSMContext):
 		await message.answer(tr.t(lang, "plugins_add_failed", error="wrong file"))
 		return
 	try:
-		file = await message.bot.get_file(doc.file_id)
-		dest_name = _safe_file_name(doc.file_name or "plugin.py")
-		dest_path = os.path.join("plugins", dest_name)
-		await message.bot.download_file(file.file_path, destination=dest_path)
+		pm = app.app_context.plugin_manager
+		meta = await _stage_and_load_plugin(message.bot, doc, pm)
 	except Exception as e:
 		await message.answer(tr.t(lang, "plugins_add_failed", error=str(e)))
 		return
 	try:
-		pm = app.app_context.plugin_manager
-		meta = pm.load_one(dest_path)
-		pm.enable(meta.uuid)
+		if not pm.enable(meta.uuid):
+			raise RuntimeError("plugin could not be enabled")
 		try:
 			from tg_bot_exfa.monitor import load_config as load_osnova_config
 			cfg2 = load_osnova_config()
@@ -119,6 +179,13 @@ async def handle_plugin_upload(message: Message, state: FSMContext):
 		except Exception:
 			await message.answer(tr.t(lang, "plugins_add_success", name=meta.name, version=meta.version), reply_markup=back_kb.as_markup())
 	except Exception as e:
+		try:
+			if pm.plugins.get(meta.uuid) is meta:
+				pm.remove(meta.uuid)
+			else:
+				Path(meta.path).unlink(missing_ok=True)
+		except Exception:
+			pass
 		data = await state.get_data()
 		target_chat = data.get("last_chat_id") or message.chat.id
 		target_msg = data.get("last_message_id") or message.message_id
@@ -211,12 +278,12 @@ async def plugin_item(callback: CallbackQuery, state: FSMContext):
 	builder.button(text=tr.t(lang, "btn_back"), callback_data="plugins:list")
 	builder.adjust(1, 1, 1)
 	lines = []
-	lines.append(f"{tr.t(lang, 'plugin_label_name')}: <code>{meta.name}</code>")
-	lines.append(f"{tr.t(lang, 'plugin_label_uuid')}: <code>{meta.uuid}</code>")
-	lines.append(f"{tr.t(lang, 'plugin_label_version')}: <code>{meta.version}</code>")
-	lines.append(f"{tr.t(lang, 'plugin_label_creator')}: <code>{meta.credits or '-'}</code>")
+	lines.append(f"{tr.t(lang, 'plugin_label_name')}: <code>{html.escape(meta.name)}</code>")
+	lines.append(f"{tr.t(lang, 'plugin_label_uuid')}: <code>{html.escape(meta.uuid)}</code>")
+	lines.append(f"{tr.t(lang, 'plugin_label_version')}: <code>{html.escape(meta.version)}</code>")
+	lines.append(f"{tr.t(lang, 'plugin_label_creator')}: <code>{html.escape(meta.credits or '-')}</code>")
 	desc = (meta.description or "").strip()
-	text = "\n".join(lines) + ("\n\n" + desc if desc else "")
+	text = "\n".join(lines) + ("\n\n" + html.escape(desc) if desc else "")
 	await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
 
@@ -288,5 +355,3 @@ async def plugin_remove(callback: CallbackQuery, state: FSMContext):
 	await callback.message.edit_text(tr.t(lang, "plugin_removed"))
 	await asyncio.sleep(1)
 	await list_plugins(callback, state)
-
-

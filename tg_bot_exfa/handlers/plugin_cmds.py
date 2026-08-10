@@ -5,9 +5,11 @@ from aiogram.fsm.context import FSMContext
 import tg_bot_exfa.app as app
 from tg_bot_exfa.monitor import load_config as load_osnova_config
 from tg_bot_exfa.plugins import PluginContext
+from tg_bot_exfa.middleware import protect_router
 
 
 router = Router()
+protect_router(router)
 
 
 @router.message(F.text.startswith("/"))
@@ -82,5 +84,4 @@ async def handle_plugin_message(message: Message, state: FSMContext):
         cfg = {}
     ctx = PluginContext(session_cookie=(cfg or {}).get("SESSION_COOKIE", ""), db=db, config=cfg or {})
     await pm.dispatch_message(message, state, ctx)
-
 
