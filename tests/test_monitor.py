@@ -2,8 +2,10 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import tg_bot_exfa.monitor as monitor
 from tg_bot_exfa.monitor import (
     AutodeliveryPending,
     _check_chats,
@@ -17,6 +19,10 @@ from tg_bot_exfa.monitor import (
     start_monitor,
 )
 from tg_bot_exfa.storage.db import Database
+
+
+def _single_page(messages):
+    return AsyncMock(return_value={"items": messages, "has_more_before": False, "next_cursor": None})
 
 
 class FakeAutodeliveryDatabase:
@@ -173,6 +179,187 @@ class MonitorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(event.is_set() for event in stopped))
 
 
+class AuthNoticeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        monitor._last_auth_notice = None
+
+    async def test_auth_state_is_reported_only_when_it_changes(self):
+        notify = AsyncMock()
+        with patch("tg_bot_exfa.monitor.send_auth_notification", notify):
+            for _ in range(3):
+                await monitor._notify_auth_state(False)
+            await monitor._notify_auth_state(True, {"id": 7})
+            await monitor._notify_auth_state(True, {"id": 7})
+            await monitor._notify_auth_state(True, {"id": 8})
+
+        self.assertEqual(
+            [call.args for call in notify.await_args_list],
+            [(False, None), (True, {"id": 7}), (True, {"id": 8})],
+        )
+
+    async def test_failed_notice_is_retried_next_time(self):
+        notify = AsyncMock(side_effect=[RuntimeError("telegram down"), None])
+        with patch("tg_bot_exfa.monitor.send_auth_notification", notify):
+            with self.assertLogs("exfador.monitor", level="WARNING"):
+                await monitor._notify_auth_state(False)
+            await monitor._notify_auth_state(False)
+
+        self.assertEqual(notify.await_count, 2)
+
+
+class RemoteAnnouncementTests(unittest.TestCase):
+    def test_announcements_require_explicit_opt_in(self):
+        with patch("tg_bot_exfa.monitor.load_config", return_value={}):
+            self.assertFalse(monitor._remote_announcements_enabled())
+        with patch("tg_bot_exfa.monitor.load_config", return_value={"REMOTE_ANNOUNCEMENTS_ENABLED": True}):
+            self.assertTrue(monitor._remote_announcements_enabled())
+
+
+class BumpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_targets_resolve_missing_ids_from_offer_pages(self):
+        lots = [
+            {"id": 1, "game_id": 2, "category_id": 3, "category_url": "https://starvell.com/roblox/robux"},
+            {"id": "uuid-2", "title": "needs detail"},
+        ]
+        detail = {"pageProps": {"offer": {"id": 99, "publicId": "uuid-2", "gameId": 5, "categoryId": 6}}}
+        with patch("tg_bot_exfa.monitor.fetch_offer_detail", AsyncMock(return_value=detail)) as fetch:
+            enriched, targets, category_url = await monitor._bump_targets("session", "sid", lots, None)
+
+        fetch.assert_awaited_once()
+        self.assertEqual(targets, {2: {3}, 5: {6}})
+        self.assertEqual(enriched[1]["game_id"], 5)
+        self.assertEqual(enriched[1]["category_id"], 6)
+        self.assertEqual(category_url, "https://starvell.com/roblox/robux")
+
+    async def test_only_lot_categories_are_bumped(self):
+        lots = [
+            {"id": 1, "game_id": 2, "category_id": 3, "offer_type": "LOT"},
+            {"id": 2, "game_id": 2, "category_id": 9, "offer_type": "GAME_CURRENCY"},
+            {"id": 3, "game_id": 4, "category_id": 5},
+        ]
+
+        _, targets, _ = await monitor._bump_targets("session", "sid", lots, None)
+
+        self.assertEqual(targets, {2: {3}, 4: {5}})
+
+    async def test_bump_cycle_sends_one_summary_for_successful_categories(self):
+        lots = {
+            "lots": [
+                {"id": 1, "game_id": 2, "category_id": 3, "title": "A"},
+                {"id": 2, "game_id": 2, "category_id": 3, "title": "B"},
+                {"id": 3, "game_id": 4, "category_id": 5, "title": "C"},
+            ],
+            "my_games": "2,4",
+        }
+
+        async def bump(session, sid, game_id, categories, referer, my_games_cookie=None):
+            success = game_id == 2
+            return {"request": {"gameId": game_id, "categoryIds": categories}, "response": {"success": success}}
+
+        summary = AsyncMock(return_value=1)
+        with (
+            patch(
+                "tg_bot_exfa.monitor.fetch_homepage_data",
+                AsyncMock(return_value={"authorized": True, "user": {"id": 7, "username": "seller"}, "sid": "sid"}),
+            ),
+            patch("tg_bot_exfa.monitor.find_user_lots", AsyncMock(return_value=lots)),
+            patch("tg_bot_exfa.monitor.bump_categories", side_effect=bump),
+            patch("tg_bot_exfa.monitor.send_bump_summary", summary),
+        ):
+            my_games, authorized, retry_after = await monitor._bump_once({"SESSION_COOKIE": "session"}, None)
+
+        self.assertTrue(authorized)
+        self.assertEqual(my_games, "2,4")
+        summary.assert_awaited_once()
+        self.assertEqual([lot["title"] for lot in summary.await_args.args[0]], ["A", "B"])
+
+    async def test_unauthorized_session_skips_bump(self):
+        with (
+            patch("tg_bot_exfa.monitor.fetch_homepage_data", AsyncMock(return_value={"authorized": False})),
+            patch("tg_bot_exfa.monitor.find_user_lots", AsyncMock()) as lots,
+        ):
+            _, authorized, _ = await monitor._bump_once({"SESSION_COOKIE": "expired"}, None)
+
+        self.assertFalse(authorized)
+        lots.assert_not_awaited()
+
+
+class RealtimePollingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        monitor.realtime.signals.reset()
+
+    async def test_event_ends_the_wait_early(self):
+        trigger = asyncio.Event()
+        trigger.set()
+        started = asyncio.get_running_loop().time()
+
+        await monitor._wait_for_poll(trigger, 60, 60)
+
+        self.assertLess(asyncio.get_running_loop().time() - started, 5)
+        self.assertFalse(trigger.is_set())
+
+    async def test_poll_relaxes_only_after_events_are_confirmed(self):
+        timeouts = []
+
+        async def fake_wait_for(awaitable, timeout):
+            awaitable.close()
+            timeouts.append(timeout)
+            raise asyncio.TimeoutError
+
+        with patch("tg_bot_exfa.monitor.asyncio.wait_for", fake_wait_for):
+            await monitor._wait_for_poll(asyncio.Event(), 5, 30)
+            monitor.realtime.signals.connected = True
+            await monitor._wait_for_poll(asyncio.Event(), 5, 30)
+            monitor.realtime.signals.confirmed = True
+            await monitor._wait_for_poll(asyncio.Event(), 5, 30)
+
+        self.assertEqual(timeouts, [5, 5, 30])
+
+    def test_relaxed_interval_is_configurable_and_bounded(self):
+        self.assertEqual(monitor._realtime_poll_interval({}), 30)
+        self.assertEqual(monitor._realtime_poll_interval({"REALTIME_POLL_INTERVAL": 120}), 120)
+        self.assertEqual(monitor._realtime_poll_interval({"REALTIME_POLL_INTERVAL": 1}), 5)
+
+
+class BumpCooldownTests(unittest.TestCase):
+    def test_cooldown_seconds_are_read_from_error_body(self):
+        raw = '{"message": "too early", "data": {"code": "OFFERS_BUMP_COOLDOWN", "retryAfterSeconds": 754}}'
+
+        self.assertEqual(monitor._bump_retry_after({"success": False, "raw": raw}), 754.0)
+        self.assertIsNone(monitor._bump_retry_after({"success": False, "raw": '{"data": {"code": "OTHER"}}'}))
+        self.assertIsNone(monitor._bump_retry_after({"success": False, "raw": "<html>"}))
+
+    def test_next_attempt_follows_cooldown_within_bounds(self):
+        self.assertEqual(monitor._next_bump_delay(1800, True, None), 1800)
+        self.assertEqual(monitor._next_bump_delay(1800, True, 600), 605)
+        self.assertEqual(monitor._next_bump_delay(1800, True, 7200), 1800)
+        self.assertEqual(monitor._next_bump_delay(1800, True, 0), 60)
+        self.assertEqual(monitor._next_bump_delay(1800, False, 600), 60)
+
+
+class MessageScanTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scan_pages_back_until_the_stored_cursor(self):
+        pages = AsyncMock(
+            side_effect=[
+                {"items": [{"id": f"m-{i}"} for i in range(60, 10, -1)], "has_more_before": True, "next_cursor": "m-11"},
+                {"items": [{"id": f"m-{i}"} for i in range(10, 0, -1)], "has_more_before": True, "next_cursor": "m-1"},
+            ]
+        )
+        with patch("tg_bot_exfa.monitor.fetch_chat_messages_page", pages):
+            messages = await monitor._scan_new_messages("session", "chat-1", 42, "m-5", 0)
+
+        self.assertEqual(pages.await_count, 2)
+        self.assertEqual(pages.await_args_list[1].kwargs["before_id"], "m-11")
+        self.assertIn({"id": "m-5"}, messages)
+
+    async def test_scan_stops_at_the_page_limit(self):
+        page = {"items": [{"id": "x"}], "has_more_before": True, "next_cursor": "x"}
+        with patch("tg_bot_exfa.monitor.fetch_chat_messages_page", AsyncMock(return_value=page)) as pages:
+            await monitor._scan_new_messages("session", "chat-1", None, "never-found", 0)
+
+        self.assertEqual(pages.await_count, monitor.CHAT_SCAN_MAX_PAGES)
+
+
 class FakeChatDatabase:
     def __init__(self):
         self.set_last_notified_message = AsyncMock()
@@ -214,7 +401,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
-            patch("tg_bot_exfa.monitor.fetch_chat_messages", AsyncMock(return_value=messages)),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", _single_page(messages)),
             patch("tg_bot_exfa.monitor.send_chat_notification", notify),
             patch("tg_bot_exfa.monitor.load_config", return_value={"WELCOME_ENABLED": False}),
         ):
@@ -244,8 +431,8 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
                 ],
             }
         }
-        fetch_messages = AsyncMock(
-            return_value=[
+        fetch_messages = _single_page(
+            [
                 {"id": "message-2", "authorId": 99, "content": "seller reply", "metadata": {}},
                 {"id": "message-0", "authorId": 42, "content": "old", "metadata": {}},
             ]
@@ -253,7 +440,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock()
         with (
             patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
-            patch("tg_bot_exfa.monitor.fetch_chat_messages", fetch_messages),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", fetch_messages),
             patch("tg_bot_exfa.monitor.send_chat_notification", notify),
             patch("tg_bot_exfa.monitor.load_config", return_value={"WELCOME_ENABLED": False}),
         ):
@@ -261,7 +448,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
 
         notify.assert_not_awaited()
         database.set_last_notified_message.assert_awaited_once_with("chat-1", "message-2")
-        self.assertEqual(fetch_messages.await_args.kwargs["limit"], 100)
+        self.assertEqual(fetch_messages.await_args.kwargs["limit"], 50)
 
     async def test_auto_latest_message_does_not_hide_earlier_user_message(self):
         database = FakeChatDatabase()
@@ -294,7 +481,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock(return_value=1)
         with (
             patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
-            patch("tg_bot_exfa.monitor.fetch_chat_messages", AsyncMock(return_value=messages)),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", _single_page(messages)),
             patch("tg_bot_exfa.monitor.send_chat_notification", notify),
             patch("tg_bot_exfa.monitor.load_config", return_value={"WELCOME_ENABLED": False}),
         ):
@@ -330,7 +517,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock()
         with (
             patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
-            patch("tg_bot_exfa.monitor.fetch_chat_messages", fetch_messages),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", fetch_messages),
             patch("tg_bot_exfa.monitor.send_chat_notification", notify),
             patch("tg_bot_exfa.monitor.load_config", return_value={"WELCOME_ENABLED": False}),
         ):
@@ -368,7 +555,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock()
         with (
             patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
-            patch("tg_bot_exfa.monitor.fetch_chat_messages", AsyncMock(return_value=messages)),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", _single_page(messages)),
             patch("tg_bot_exfa.monitor.send_chat_notification", notify),
             patch("tg_bot_exfa.monitor.load_config", return_value={"WELCOME_ENABLED": False}),
         ):
@@ -410,7 +597,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
         send_welcome = AsyncMock(return_value={"success": True})
         with (
             patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
-            patch("tg_bot_exfa.monitor.fetch_chat_messages", AsyncMock(return_value=messages)),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", _single_page(messages)),
             patch("tg_bot_exfa.monitor.send_chat_message", send_welcome),
             patch("tg_bot_exfa.monitor.send_chat_notification", AsyncMock(return_value=1)),
             patch(
@@ -462,7 +649,7 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock(return_value=1)
         with (
             patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
-            patch("tg_bot_exfa.monitor.fetch_chat_messages", AsyncMock(return_value=messages)),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", _single_page(messages)),
             patch("tg_bot_exfa.monitor.send_chat_notification", notify),
             patch("tg_bot_exfa.monitor.load_config", return_value={"WELCOME_ENABLED": False}),
         ):
@@ -473,6 +660,81 @@ class ChatCursorTests(unittest.IsolatedAsyncioTestCase):
             database.set_last_notified_message.await_args_list[-1].args,
             ("chat-1", "message-2"),
         )
+
+    async def test_auto_read_marks_chat_after_successful_notification(self):
+        database = FakeChatDatabase()
+        chat_page = {
+            "pageProps": {
+                "user": {"id": 99},
+                "chats": [
+                    {
+                        "id": "chat-1",
+                        "unreadMessageCount": 1,
+                        "participants": [{"id": 99}, {"id": 42, "username": "buyer"}],
+                        "lastMessage": {"id": "message-1", "authorId": 42, "content": "hi", "metadata": {}},
+                    }
+                ],
+            }
+        }
+        messages = [
+            {"id": "message-1", "authorId": 42, "content": "hi", "metadata": {}},
+            {"id": "message-0", "authorId": 42, "content": "old", "metadata": {}},
+        ]
+        for auto_read, notify_result, expected_calls in ((True, 1, 1), (False, 1, 0), (True, RuntimeError("tg"), 0)):
+            mark_read = AsyncMock()
+            notify = AsyncMock(side_effect=[notify_result]) if isinstance(notify_result, Exception) else AsyncMock(return_value=notify_result)
+            with (
+                patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
+                patch("tg_bot_exfa.monitor.fetch_chat_messages_page", _single_page(messages)),
+                patch("tg_bot_exfa.monitor.send_chat_notification", notify),
+                patch("tg_bot_exfa.monitor.mark_chat_read", mark_read),
+                patch(
+                    "tg_bot_exfa.monitor.load_config",
+                    return_value={"WELCOME_ENABLED": False, "AUTO_READ_CHATS": auto_read},
+                ),
+            ):
+                if isinstance(notify_result, Exception):
+                    with self.assertLogs("exfador.monitor", level="WARNING"):
+                        await _check_chats("session", database, user_id=99)
+                else:
+                    await _check_chats("session", database, user_id=99)
+            self.assertEqual(mark_read.await_count, expected_calls, (auto_read, notify_result))
+
+    async def test_fresh_cursor_notifies_only_unread_messages_not_history(self):
+        class FreshDatabase(FakeChatDatabase):
+            async def get_last_notified_message(self, chat_id):
+                return None
+
+        database = FreshDatabase()
+        chat_page = {
+            "pageProps": {
+                "user": {"id": 99},
+                "chats": [
+                    {
+                        "id": "chat-1",
+                        "unreadMessageCount": 1,
+                        "participants": [{"id": 99}, {"id": 42, "username": "buyer"}],
+                        "lastMessage": {"id": "message-3", "authorId": 42, "content": "new", "metadata": {}},
+                    }
+                ],
+            }
+        }
+        history = [
+            {"id": "message-3", "authorId": 42, "content": "new", "metadata": {}},
+            {"id": "message-2", "authorId": 42, "content": "last week", "metadata": {}},
+            {"id": "message-1", "authorId": 42, "content": "last month", "metadata": {}},
+        ]
+        notify = AsyncMock(return_value=1)
+        with (
+            patch("tg_bot_exfa.monitor.fetch_chats", AsyncMock(return_value=chat_page)),
+            patch("tg_bot_exfa.monitor.fetch_chat_messages_page", _single_page(history)),
+            patch("tg_bot_exfa.monitor.send_chat_notification", notify),
+            patch("tg_bot_exfa.monitor.load_config", return_value={"WELCOME_ENABLED": False}),
+        ):
+            await _check_chats("session", database, user_id=99)
+
+        notify.assert_awaited_once()
+        self.assertEqual(notify.await_args.args[1], "new")
 
 
 class FakeOrderDatabase:
@@ -571,6 +833,88 @@ class OrderRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await database.is_order_notified("order-1"))
             delivery = await database.get_order_delivery("order-1")
             self.assertEqual(delivery["state"], "owner_notified")
+
+    async def test_owner_notification_retry_never_redispatches_order_to_plugins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(str(Path(directory) / "bot.sqlite3"))
+            await database.init()
+            order = {
+                "id": "order-1",
+                "status": "CREATED",
+                "quantity": 1,
+                "user": {"id": 42, "username": "buyer"},
+                "offerDetails": {"descriptions": {"rus": {"briefDescription": "Stars"}}},
+            }
+            plugins = SimpleNamespace(dispatch_order_created=AsyncMock())
+            owner_send = AsyncMock(side_effect=[RuntimeError("no recipients"), RuntimeError("no recipients"), 1])
+            with (
+                patch(
+                    "tg_bot_exfa.monitor.fetch_sells",
+                    AsyncMock(return_value={"pageProps": {"orders": [order]}}),
+                ),
+                patch("tg_bot_exfa.monitor.send_order_notification", owner_send),
+                patch("tg_bot_exfa.monitor.load_config", return_value={"DEBUG": False}),
+                patch("tg_bot_exfa.app.app_context", SimpleNamespace(plugin_manager=plugins)),
+            ):
+                for _ in range(2):
+                    with self.assertLogs("exfador.monitor", level="WARNING"):
+                        await _check_orders("session", database)
+                await _check_orders("session", database)
+
+            self.assertEqual(owner_send.await_count, 3)
+            plugins.dispatch_order_created.assert_awaited_once()
+            self.assertTrue(await database.is_order_notified("order-1"))
+
+    async def test_insufficient_stock_warns_owner_and_delivers_after_restock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(str(Path(directory) / "bot.sqlite3"))
+            await database.init()
+            await database.add_autodelivery_items("Robux", ["code-1"])
+            order = {
+                "id": "order-1",
+                "status": "CREATED",
+                "quantity": 2,
+                "user": {"id": 42, "username": "buyer"},
+                "offerDetails": {"descriptions": {"rus": {"briefDescription": "Robux"}}},
+            }
+            plugins = SimpleNamespace(dispatch_order_created=AsyncMock())
+            owner_send = AsyncMock(return_value=1)
+            buyer_send = AsyncMock(return_value={"success": True})
+            with (
+                patch(
+                    "tg_bot_exfa.monitor.fetch_sells",
+                    AsyncMock(return_value={"pageProps": {"orders": [order]}}),
+                ),
+                patch(
+                    "tg_bot_exfa.monitor.fetch_chats",
+                    AsyncMock(
+                        return_value={"pageProps": {"chats": [{"id": "chat-1", "participants": [{"id": 42}]}]}}
+                    ),
+                ),
+                patch("tg_bot_exfa.monitor.send_chat_message", buyer_send),
+                patch("tg_bot_exfa.monitor.send_order_notification", owner_send),
+                patch("tg_bot_exfa.monitor.load_config", return_value={"DEBUG": False, "WATERMARK_ON": False}),
+                patch("tg_bot_exfa.app.app_context", SimpleNamespace(plugin_manager=plugins)),
+            ):
+                with self.assertLogs("exfador.monitor", level="WARNING"):
+                    await _check_orders("session", database)
+
+                owner_send.assert_awaited_once_with(
+                    order,
+                    event_id="order-1:autodelivery-insufficient",
+                    ad_warning=("Robux", "ad_fail_insufficient", {"required": 2, "available": 1}),
+                )
+                buyer_send.assert_not_awaited()
+                plugins.dispatch_order_created.assert_not_awaited()
+                self.assertFalse(await database.is_order_notified("order-1"))
+
+                await database.add_autodelivery_items("Robux", ["code-2"])
+                await _check_orders("session", database)
+
+            buyer_send.assert_awaited_once_with("session", "chat-1", "code-1\ncode-2")
+            self.assertEqual(owner_send.await_args.args, (order, ("Robux", "code-1\ncode-2")))
+            plugins.dispatch_order_created.assert_awaited_once()
+            self.assertTrue(await database.is_order_notified("order-1"))
 
     async def test_completed_notification_failure_retries_before_status_commit(self):
         class CompletionDatabase:

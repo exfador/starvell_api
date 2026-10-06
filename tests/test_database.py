@@ -1,4 +1,5 @@
 import asyncio
+import os
 import stat
 import tempfile
 import unittest
@@ -12,7 +13,8 @@ class AutodeliveryDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Database(str(Path(directory) / "bot.sqlite3"))
             await database.init()
-            self.assertEqual(stat.S_IMODE(Path(database.path).stat().st_mode), 0o600)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(Path(database.path).stat().st_mode), 0o600)
             await database.add_autodelivery_items("Robux", ["code-1", "code-2"])
 
             items = await database.peek_autodelivery_items("Robux", limit=2)
@@ -38,6 +40,36 @@ class AutodeliveryDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(revoked, 1)
             self.assertTrue((await database.get_user(1))["authorized"])
             self.assertFalse((await database.get_user(2))["authorized"])
+
+    async def test_revocation_reports_exactly_the_revoked_users(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(str(Path(directory) / "bot.sqlite3"))
+            await database.init()
+            for user_id in (1, 2, 3, 4):
+                await database.get_user(user_id)
+            for user_id in (1, 2, 3):
+                await database.set_authorized(user_id, True)
+
+            revoked = await database.revoke_authorized_users(except_user_id=1)
+
+            self.assertEqual(sorted(revoked), [2, 3])
+            self.assertEqual(await database.revoke_authorized_users(except_user_id=1), [])
+
+    async def test_order_reaches_plugins_once_across_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "bot.sqlite3")
+            first = Database(path)
+            second = Database(path)
+            await first.init()
+
+            claims = await asyncio.gather(
+                first.claim_order_plugin_dispatch("order-1"),
+                second.claim_order_plugin_dispatch("order-1"),
+            )
+
+            self.assertEqual(sorted(claims), [False, True])
+            self.assertFalse(await first.claim_order_plugin_dispatch("order-1"))
+            self.assertTrue(await first.claim_order_plugin_dispatch("order-2"))
 
     async def test_reservation_requires_the_full_order_quantity(self):
         with tempfile.TemporaryDirectory() as directory:

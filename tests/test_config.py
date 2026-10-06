@@ -1,4 +1,5 @@
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -38,5 +39,5 @@ class ConfigPersistenceTests(unittest.TestCase):
 
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(data["BOT_TOKEN"], "token")
-            if hasattr(stat, "S_IMODE"):
+            if os.name != "nt":
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)

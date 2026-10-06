@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import stat
 import tempfile
 import time
@@ -47,7 +48,35 @@ class PluginManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(manager.enable("plugin-1"))
             self.assertTrue(marker.exists())
             self.assertIn("hello", manager.commands)
-            self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
+
+    async def test_disabled_plugin_with_info_dict_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "plugins"
+            root.mkdir()
+            marker = Path(directory) / "imported.txt"
+            source = (
+                'INFO = {"name": "Info plugin", "uuid": "info-1", "version": "2.0", "credits": "@dev"}\n'
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
+            )
+            (root / "info_plugin.py").write_text(source, encoding="utf-8")
+            state = Path(directory) / "state.json"
+            state.write_text(json.dumps({"disabled": ["info-1"]}), encoding="utf-8")
+            manager = PluginManager(str(root), str(state))
+
+            manager.load_all()
+
+            self.assertFalse(marker.exists())
+            meta = manager.plugins["info-1"]
+            self.assertEqual((meta.name, meta.version, meta.credits), ("Info plugin", "2.0", "@dev"))
+            self.assertIsNone(meta.module)
+
+    def test_metadata_is_read_without_execution_and_constants_win(self):
+        manager = PluginManager(tempfile.gettempdir(), str(Path(tempfile.gettempdir()) / "state.json"))
+        text = 'INFO = {"uuid": "from-info", "name": "Info"}\nUUID = "from-constant"\nraise SystemExit("never run")\n'
+
+        self.assertEqual(manager._extract_meta_ast(text), {"UUID": "from-constant", "NAME": "Info"})
 
     async def test_duplicate_and_reserved_commands_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

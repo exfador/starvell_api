@@ -7,14 +7,23 @@ import aiohttp
 
 from api.auth import fetch_homepage_data
 from api.bump import bump_categories
-from api.chats import fetch_chats
+from api.chats import fetch_chats, mark_chat_read
 from api.find_lots_user import find_user_lots
-from api.http_client import HttpResponse, request_text
-from api.messages import fetch_chat_messages
+from api.http_client import HttpResponse, _error_detail, request_text
+from api.messages import fetch_chat_messages, fetch_chat_messages_page
 from api.next_data import _fetch_build_id
 from api.offer_details import fetch_offer_detail
-from api.orders import fetch_sells, refund_order
+from api.orders import fetch_seller_orders, fetch_seller_orders_all, fetch_sells, refund_order
 from api.send_message import send_chat_image, send_chat_message
+
+
+class _FakeContent:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    async def iter_chunked(self, size):
+        for start in range(0, len(self._body), size):
+            yield self._body[start : start + size]
 
 
 class _FakeResponse:
@@ -22,6 +31,9 @@ class _FakeResponse:
         self.status = status
         self._text = text
         self.headers = headers or {}
+        self.charset = "utf-8"
+        self.content_length = len(text.encode("utf-8"))
+        self.content = _FakeContent(text.encode("utf-8"))
         self.cookies = {
             name: SimpleNamespace(value=value)
             for name, value in (cookies or {}).items()
@@ -102,9 +114,77 @@ class ApiContractTests(unittest.IsolatedAsyncioTestCase):
         args = request.await_args
         self.assertEqual(args.args[:2], ("POST", "https://starvell.com/api/bff/chat-page"))
         self.assertEqual(args.kwargs["json"]["interlocutorId"], 42)
-        self.assertEqual(args.kwargs["json"]["messagesListDto"]["limit"], 100)
+        self.assertEqual(args.kwargs["json"]["messagesListDto"]["limit"], 50)
         self.assertEqual(args.kwargs["cookies"]["starvell.my_games"], "2,3")
         self.assertNotIn("retry_safe", args.kwargs)
+
+    async def test_messages_without_interlocutor_use_documented_list_v2(self):
+        request = AsyncMock(return_value={"items": [{"id": "m-1"}], "hasMoreBefore": True, "nextCursor": "m-0"})
+        with patch("api.messages.request_json", request):
+            page = await fetch_chat_messages_page("session", "chat-1", limit=20)
+
+        self.assertEqual(request.await_args.args, ("POST", "https://starvell.com/api/messages/list-v2"))
+        self.assertEqual(request.await_args.kwargs["json"], {"chatId": "chat-1", "limit": 20})
+        self.assertEqual(page, {"items": [{"id": "m-1"}], "has_more_before": True, "next_cursor": "m-0"})
+
+    async def test_older_pages_use_before_cursor_even_with_interlocutor(self):
+        request = AsyncMock(
+            return_value={"messagesListResult": {"items": [], "hasMoreBefore": False, "nextCursor": None}}
+        )
+        with patch("api.messages.request_json", request):
+            page = await fetch_chat_messages_page("session", "chat-1", interlocutor_id=42, before_id="m-9")
+
+        self.assertEqual(request.await_args.args[1], "https://starvell.com/api/messages/list-v2")
+        self.assertEqual(request.await_args.kwargs["json"], {"chatId": "chat-1", "limit": 50, "beforeId": "m-9"})
+        self.assertFalse(page["has_more_before"])
+
+    async def test_mark_chat_read_posts_documented_payload(self):
+        for body in ("", "{}", '{"success": true}'):
+            request = AsyncMock(return_value=HttpResponse(200, {"Content-Type": "application/json"}, body, {}))
+            with patch("api.chats.request_text", request):
+                await mark_chat_read("session", "chat-1", my_games_cookie="7")
+
+            self.assertEqual(request.await_args.args, ("POST", "https://starvell.com/api/chats/read"))
+            self.assertEqual(request.await_args.kwargs["json"], {"chatId": "chat-1"})
+            self.assertEqual(request.await_args.kwargs["cookies"]["starvell.my_games"], "7")
+            self.assertNotIn("retry_safe", request.await_args.kwargs)
+
+    async def test_mark_chat_read_surfaces_starvell_errors(self):
+        response = HttpResponse(200, {"Content-Type": "application/json"}, '{"success": false, "message": "no chat"}', {})
+        with (
+            patch("api.chats.request_text", AsyncMock(return_value=response)),
+            self.assertRaisesRegex(Exception, "no chat"),
+        ):
+            await mark_chat_read("session", "chat-1")
+
+    async def test_seller_orders_use_documented_paginated_list(self):
+        request = AsyncMock(return_value={"data": [{"id": "order-1"}, "junk"]})
+        with patch("api.orders.request_json", request):
+            orders = await fetch_seller_orders("session", offset=40, status="CREATED")
+
+        self.assertEqual(orders, [{"id": "order-1"}])
+        self.assertEqual(request.await_args.args, ("POST", "https://starvell.com/api/orders/list"))
+        self.assertEqual(
+            request.await_args.kwargs["json"],
+            {"filter": {"userType": "seller", "status": "CREATED"}, "limit": 20, "offset": 40, "with": {"buyer": True}},
+        )
+        self.assertTrue(request.await_args.kwargs["retry_safe"])
+
+    async def test_seller_orders_stop_on_short_page(self):
+        pages = [[{"id": str(index)} for index in range(20)], [{"id": "20"}]]
+        with patch("api.orders.fetch_seller_orders", AsyncMock(side_effect=pages)) as fetch:
+            orders = await fetch_seller_orders_all("session")
+
+        self.assertEqual(len(orders), 21)
+        self.assertEqual([call.kwargs["offset"] for call in fetch.await_args_list], [0, 20])
+
+    def test_starvell_error_bodies_become_readable_details(self):
+        self.assertEqual(
+            _error_detail(json.dumps({"message": ["chatId must be a string", "limit too big"], "data": {"code": "BAD"}})),
+            "chatId must be a string; limit too big [BAD]",
+        )
+        self.assertIn("anti-bot", _error_detail("<html><body>blocked</body></html>"))
+        self.assertEqual(_error_detail("plain   text"), "plain text")
 
     async def test_sells_page_is_encoded_in_next_data_url(self):
         request = AsyncMock(return_value={"pageProps": {"orders": []}})
@@ -216,6 +296,65 @@ class ApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.await_args.kwargs["cookies"]["sid"], "sid")
         self.assertEqual(request.await_args.kwargs["cookies"]["starvell.my_games"], "8")
         self.assertTrue(request.await_args.kwargs["retry_safe"])
+
+    async def test_lots_are_read_from_the_redesigned_profile_page(self):
+        payload = {
+            "pageProps": {
+                "foreignProfileUser": {"id": 1001, "username": "seller"},
+                "catalogUserProfileOffersResult": {
+                    "hasMore": False,
+                    "categories": [
+                        {
+                            "id": 182,
+                            "slug": "stars",
+                            "offerType": "LOT",
+                            "game": {"id": 14, "slug": "telegram", "name": "Telegram"},
+                            "offers": [
+                                {
+                                    "publicId": "00000000-0000-4000-8000-000000000001",
+                                    "price": "100.00",
+                                    "availability": 9999999,
+                                    "descriptions": {"rus": {"briefDescription": "50 звёзд"}},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        }
+        with (
+            patch("api.find_lots_user.get_build_id", AsyncMock(return_value="build")),
+            patch("api.find_lots_user.request_json", AsyncMock(return_value=payload)),
+        ):
+            result = await find_user_lots("session", "sid", 1001, username="Seller")
+
+        lot = result["lots"][0]
+        self.assertEqual(lot["id"], "00000000-0000-4000-8000-000000000001")
+        self.assertEqual((lot["game_id"], lot["category_id"], lot["offer_type"]), (14, 182, "LOT"))
+        self.assertEqual(lot["category_url"], "https://starvell.com/telegram/stars")
+        self.assertEqual(lot["title"], "50 звёзд")
+        self.assertEqual(result["my_games"], "14")
+        self.assertFalse(result["partial"])
+
+    async def test_partial_profile_list_is_flagged(self):
+        payload = {"pageProps": {"catalogUserProfileOffersResult": {"hasMore": True, "categories": []}}}
+        with (
+            patch("api.find_lots_user.get_build_id", AsyncMock(return_value="build")),
+            patch("api.find_lots_user.request_json", AsyncMock(return_value=payload)),
+            self.assertLogs("exfador.lots", level="WARNING"),
+        ):
+            result = await find_user_lots("session", "sid", 1, username="seller")
+
+        self.assertTrue(result["partial"])
+
+    async def test_unknown_profile_layout_names_the_returned_keys(self):
+        payload = {"pageProps": {"reviews": [], "somethingNew": {}}}
+        with (
+            patch("api.find_lots_user.get_build_id", AsyncMock(return_value="build")),
+            patch("api.find_lots_user.request_json", AsyncMock(return_value=payload)),
+            self.assertRaisesRegex(Exception, "keys: reviews, somethingNew"),
+        ):
+            await find_user_lots("session", "sid", 1, username="seller")
 
     async def test_offer_detail_uses_offer_next_route(self):
         request = AsyncMock(return_value={"pageProps": {"offer": {"id": 7}}})

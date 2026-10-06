@@ -31,6 +31,10 @@ class DatabaseRetentionTests(unittest.IsolatedAsyncioTestCase):
                 "INSERT INTO notification_receipts(event_kind, event_id, user_id, created_at) VALUES(?, ?, ?, ?)",
                 [("chat", "old", 1, old), ("chat", "recent", 1, recent)],
             )
+            await conn.executemany(
+                "INSERT INTO order_plugin_dispatches(order_id, created_at) VALUES(?, ?)",
+                [("old", old), ("recent", recent)],
+            )
             await conn.execute(
                 "INSERT INTO order_deliveries(order_id, product, quantity, item_ids, item_values, state, updated_at) "
                 "VALUES('done-old', 'p', 1, '[]', '[]', 'owner_notified', ?)",
@@ -47,6 +51,7 @@ class DatabaseRetentionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(deleted["orders_notified"], 1)
         self.assertEqual(deleted["notification_receipts"], 1)
+        self.assertEqual(deleted["order_plugin_dispatches"], 1)
         self.assertEqual(deleted["order_deliveries"], 1)
         async with aiosqlite.connect(self.path) as conn:
             notified = await (await conn.execute("SELECT order_id FROM orders_notified ORDER BY order_id")).fetchall()

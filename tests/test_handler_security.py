@@ -6,9 +6,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
+
+import tg_bot_exfa.app as app
 from tg_bot_exfa.handlers.plugins import MAX_PLUGIN_BYTES, _stage_and_load_plugin
-from tg_bot_exfa.handlers.start import _run_password_work
+from tg_bot_exfa.config import hash_password
+from tg_bot_exfa.handlers.start import _run_password_work, on_change_password, on_password
 from tg_bot_exfa.plugins.manager import PluginManager
+from tg_bot_exfa.states.auth import StartFlow
+from tg_bot_exfa.storage.db import Database
 
 
 class PasswordWorkTests(unittest.IsolatedAsyncioTestCase):
@@ -37,6 +45,111 @@ class PasswordWorkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(peak, 2)
             release.set()
             self.assertEqual(await asyncio.gather(*tasks), [0, 1, 2, 3])
+
+
+class PasswordChangeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.tmp.name) / "bot.sqlite3"))
+        await self.db.init()
+        self.config = SimpleNamespace(password_md5="old-hash", default_language="ru")
+        app.app_context = SimpleNamespace(db=self.db, config=self.config)
+        self.storage = MemoryStorage()
+
+    async def asyncTearDown(self):
+        app.app_context = None
+        self.tmp.cleanup()
+
+    def _context(self, user_id: int) -> FSMContext:
+        return FSMContext(self.storage, StorageKey(bot_id=1, chat_id=user_id, user_id=user_id))
+
+    def _message(self, user_id: int, text: str):
+        return SimpleNamespace(
+            from_user=SimpleNamespace(id=user_id),
+            chat=SimpleNamespace(id=user_id),
+            message_id=50,
+            text=text,
+            delete=AsyncMock(),
+            answer=AsyncMock(),
+            bot=SimpleNamespace(edit_message_text=AsyncMock()),
+        )
+
+    async def _authorize(self, *user_ids: int):
+        for user_id in user_ids:
+            await self.db.get_user(user_id)
+            await self.db.set_authorized(user_id, True)
+
+    async def test_revoked_user_with_stale_dialog_cannot_change_password(self):
+        await self._authorize(1, 2)
+        stale = self._context(2)
+        await stale.set_state(StartFlow.changing_password)
+        await self.db.revoke_authorizations(except_user_id=1)
+        message = self._message(2, "takeover")
+
+        with patch("tg_bot_exfa.handlers.start.save_config") as save:
+            await on_change_password(message, stale)
+
+        save.assert_not_called()
+        self.assertEqual(self.config.password_md5, "old-hash")
+        self.assertTrue((await self.db.get_user(1))["authorized"])
+        self.assertIsNone(await stale.get_state())
+        message.delete.assert_awaited_once()
+
+    async def test_password_change_revokes_others_and_resets_their_dialogs(self):
+        await self._authorize(1, 2)
+        owner, other = self._context(1), self._context(2)
+        await owner.set_state(StartFlow.changing_password)
+        await other.set_state(StartFlow.changing_session)
+        await other.update_data(last_message_id=7)
+
+        with (
+            patch("tg_bot_exfa.handlers.start.save_config") as save,
+            patch("tg_bot_exfa.handlers.start.hash_password", lambda value: f"hash:{value}"),
+        ):
+            await on_change_password(self._message(1, "new-password"), owner)
+
+        save.assert_called_once()
+        self.assertEqual(self.config.password_md5, "hash:new-password")
+        self.assertTrue((await self.db.get_user(1))["authorized"])
+        self.assertFalse((await self.db.get_user(2))["authorized"])
+        self.assertIsNone(await other.get_state())
+        self.assertEqual(await other.get_data(), {})
+        self.assertIsNone(await owner.get_state())
+
+
+class LoginLockoutTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.tmp.name) / "bot.sqlite3"))
+        await self.db.init()
+        app.app_context = SimpleNamespace(
+            db=self.db,
+            config=SimpleNamespace(password_md5=hash_password("right", iterations=1_000), default_language="ru"),
+        )
+
+    async def asyncTearDown(self):
+        app.app_context = None
+        self.tmp.cleanup()
+
+    async def test_block_resets_the_attempt_counter(self):
+        state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=5, user_id=5))
+        for _ in range(5):
+            await state.set_state(StartFlow.waiting_password)
+            await state.update_data(last_message_id=9)
+            message = SimpleNamespace(
+                from_user=SimpleNamespace(id=5, username="guest"),
+                chat=SimpleNamespace(id=5),
+                text="wrong",
+                delete=AsyncMock(),
+                answer=AsyncMock(),
+                bot=SimpleNamespace(edit_message_text=AsyncMock()),
+            )
+            with patch("tg_bot_exfa.handlers.start.send_security_auth_blocked", AsyncMock()):
+                await on_password(message, state)
+
+        user = await self.db.get_user(5)
+        self.assertGreater(user["blocked_until"], 0)
+        self.assertEqual(user["failed_attempts"], 0)
 
 
 class _FakePluginManager:
