@@ -1,15 +1,19 @@
-from aiohttp import ClientResponseError
+import logging
 from urllib.parse import quote
 
+from aiohttp import ClientResponseError
+
+from api.auth_constants import AUTH_ATTEMPTS, AUTH_HEADERS, AUTH_TIMEOUT
+from api.auth_cookies import authentication_cookies
 from api.http_client import request_json
 from api.next_data import get_build_id, reset_build_id
 from api.response import StarvellResponseError, page_props as get_page_props
 
 
-def _maybe_int(v):
+def _maybe_int(value):
     try:
-        return int(v)
-    except Exception:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -17,8 +21,27 @@ def _identifier(value):
     numeric = _maybe_int(value)
     if numeric is not None:
         return numeric
-    text = str(value or "").strip()
-    return text or None
+    return str(value or "").strip() or None
+
+
+def _profile_categories(props: dict) -> tuple[list, bool]:
+    containers = [props]
+    if isinstance(props.get("bff"), dict):
+        containers.append(props["bff"])
+    for container in containers:
+        catalog = container.get("catalogUserProfileOffersResult")
+        if isinstance(catalog, dict) and "categories" in catalog:
+            if not isinstance(catalog["categories"], list):
+                raise StarvellResponseError("find user lots: invalid category list")
+            return catalog["categories"], bool(catalog.get("hasMore"))
+        for key in ("userProfileOffers", "categoriesWithOffers"):
+            if key not in container:
+                continue
+            value = container[key]
+            if not isinstance(value, list):
+                raise StarvellResponseError("find user lots: invalid category list")
+            return value, False
+    raise StarvellResponseError(f"find user lots: response has no category list (keys: {', '.join(sorted(props)[:20])})")
 
 
 async def find_user_lots(
@@ -28,108 +51,89 @@ async def find_user_lots(
     username: str | None = None,
     my_games_cookie: str | None = None,
 ) -> dict:
-
-    profile_name = str(username or user_id).strip()
+    profile_name = str(username or user_id).strip().lower()
     if not profile_name:
         raise ValueError("find user lots: username is missing")
-    encoded_profile_name = quote(profile_name, safe="")
-
-    headers = {
-        "accept": "*/*",
-        "accept-language": "ru,en;q=0.9",
-        "referer": f"https://starvell.com/profile/{encoded_profile_name}",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 YaBrowser/25.8.0.0 Safari/537.36",
-        "x-nextjs-data": "1",
-    }
-    cookies = {"session": session_cookie, "starvell.theme": "dark", "starvell.time_zone": "Europe/Moscow"}
-
-    if my_games_cookie:
-        cookies["starvell.my_games"] = my_games_cookie
+    cookies = authentication_cookies(session_cookie, my_games_cookie)
     if sid_cookie:
         cookies["sid"] = sid_cookie
+    data = await _fetch_profile(cookies, profile_name)
+    categories, has_more = _profile_categories(get_page_props(data, "find user lots"))
+    if has_more:
+        logging.getLogger("exfador.lots").warning(
+            "profile_offers_partial username=%s categories=%s: Starvell returned only the first part of the lot list",
+            profile_name,
+            len(categories),
+        )
+    lots, game_ids = _collect_lots(categories)
+    derived_games = ",".join(str(game_id) for game_id in sorted(game_ids))
+    return {"lots": lots, "my_games": derived_games or my_games_cookie, "partial": has_more}
 
-    last_exc = None
-    data = None
-    for attempt in range(2):
-        build_id = await get_build_id(session_cookie)
-        url = f"https://starvell.com/_next/data/{build_id}/profile/{encoded_profile_name}.json"
+
+async def _fetch_profile(cookies: dict, name: str) -> dict:
+    encoded_name = quote(name, safe="")
+    headers = {**AUTH_HEADERS, "referer": f"https://starvell.com/profile/{encoded_name}"}
+    for attempt in range(AUTH_ATTEMPTS):
+        build_id = await get_build_id(cookies.get("session", ""))
         try:
-            data = await request_json(
+            return await request_json(
                 "GET",
-                url,
+                f"https://starvell.com/_next/data/{build_id}/profile/{encoded_name}.json",
                 headers=headers,
                 cookies=cookies,
-                timeout=20,
+                timeout=AUTH_TIMEOUT,
                 retry_safe=True,
-                params={"username": profile_name},
+                allow_redirects=False,
+                params={"username": name},
             )
-            break
-        except ClientResponseError as exc:
-            last_exc = exc
-            if exc.status == 404 and attempt == 0:
+        except ClientResponseError as error:
+            if error.status == 404 and attempt + 1 < AUTH_ATTEMPTS:
                 reset_build_id()
                 continue
             raise
+    raise StarvellResponseError("Unable to fetch user lots")
 
-    if data is None and last_exc:
-        raise last_exc
-    if data is None:
-        raise RuntimeError("Unable to fetch user lots")
 
-    page_props = get_page_props(data, "find user lots")
-
-    user_profile_offers = page_props.get("userProfileOffers")
-    if not user_profile_offers:
-        user_profile_offers = (page_props.get("bff") or {}).get("userProfileOffers")
-
-    lots: list[dict] = []
-
-    categories = user_profile_offers or page_props.get("categoriesWithOffers") or []
-    if not isinstance(categories, list):
-        raise StarvellResponseError("find user lots: response has no category list")
-
-    seen_game_ids: set[int] = set()
+def _collect_lots(categories: list) -> tuple[list[dict], set[int]]:
+    lots, game_ids = [], set()
     for category in categories:
         if not isinstance(category, dict):
-            continue
-        category_id = _maybe_int(category.get("id"))
-        category_slug = str(category.get("slug") or "").strip() or None
-        game_id = _maybe_int(category.get("gameId") or (category.get("game") or {}).get("id"))
-        if isinstance(game_id, int):
-            seen_game_ids.add(game_id)
-        game_slug = str((category.get("game") or {}).get("slug") or "").strip() or None
-        category_url = None
-        if game_slug and category_slug:
-            category_url = f"https://starvell.com/{game_slug}/{category_slug}/trade"
+            raise StarvellResponseError("find user lots: invalid category")
+        category_lots, game_id = _category_lots(category)
+        lots.extend(category_lots)
+        if game_id is not None:
+            game_ids.add(game_id)
+    return lots, game_ids
 
-        offers = category.get("offers") or []
-        if not isinstance(offers, list):
-            continue
-        for offer in offers:
-            if not isinstance(offer, dict):
-                continue
-            offer_id = _identifier(offer.get("publicId") or offer.get("id"))
-            price = offer.get("price")
-            availability = offer.get("availability")
-            brief = (
-                (offer.get("descriptions") or {}).get("rus", {}).get("briefDescription")
-                or (offer.get("descriptions") or {}).get("rus", {}).get("description")
-            )
-            title = str(brief).strip() if brief else None
-            lots.append(
-                {
-                    "id": offer_id,
-                    "title": title,
-                    "availability": availability,
-                    "price": price,
-                    "url": f"https://starvell.com/offers/{offer_id}" if offer_id else None,
-                    "category_id": category_id,
-                    "game_id": game_id,
-                    "category_url": category_url,
-                }
-            )
 
-    derived_my_games = None
-    if seen_game_ids:
-        derived_my_games = ",".join(str(x) for x in sorted(seen_game_ids))
-    return {"lots": lots, "my_games": derived_my_games or my_games_cookie}
+def _category_lots(category: dict) -> tuple[list[dict], int | None]:
+    game = category.get("game") or {}
+    game_id = _maybe_int(category.get("gameId") or game.get("id"))
+    game_slug = str(game.get("slug") or "").strip()
+    category_slug = str(category.get("slug") or "").strip()
+    context = {
+        "category_id": _maybe_int(category.get("id")),
+        "game_id": game_id,
+        "category_url": f"https://starvell.com/{game_slug}/{category_slug}" if game_slug and category_slug else None,
+        "offer_type": category.get("offerType"),
+    }
+    offers = category.get("offers") or []
+    if not isinstance(offers, list):
+        raise StarvellResponseError("find user lots: invalid offers")
+    return [_offer_lot(offer, context) for offer in offers], game_id
+
+
+def _offer_lot(offer: dict, context: dict) -> dict:
+    if not isinstance(offer, dict):
+        raise StarvellResponseError("find user lots: invalid offer")
+    offer_id = _identifier(offer.get("publicId") or offer.get("id"))
+    description = (offer.get("descriptions") or {}).get("rus") or {}
+    title = description.get("briefDescription") or description.get("description")
+    return {
+        **context,
+        "id": offer_id,
+        "title": str(title).strip() if title else None,
+        "availability": offer.get("availability"),
+        "price": offer.get("price"),
+        "url": f"https://starvell.com/offers/{offer_id}" if offer_id else None,
+    }

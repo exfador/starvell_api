@@ -1,8 +1,10 @@
+import json
+
 from aiohttp import ClientResponseError
 
-from api.http_client import request_json
+from api.http_client import request_json, request_text
 from api.next_data import get_build_id, reset_build_id
-from api.response import normalize_page_collection
+from api.response import ensure_success, normalize_page_collection
 
 
 async def fetch_chats(session_cookie: str, my_games_cookie: str | None = None) -> dict:
@@ -34,6 +36,35 @@ async def fetch_chats(session_cookie: str, my_games_cookie: str | None = None) -
     if last_exc:
         raise last_exc
     raise RuntimeError("Unable to fetch chat list")
+
+
+async def mark_chat_read(session_cookie: str, chat_id: str, my_games_cookie: str | None = None) -> dict:
+    headers = {
+        "accept": "*/*",
+        "accept-language": "ru,en;q=0.9",
+        "content-type": "application/json",
+        "origin": "https://starvell.com",
+        "referer": f"https://starvell.com/chat/{chat_id}",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 YaBrowser/25.8.0.0 Safari/537.36",
+    }
+    cookies = {"session": session_cookie, "starvell.theme": "dark", "starvell.time_zone": "Europe/Moscow"}
+    if my_games_cookie:
+        cookies["starvell.my_games"] = my_games_cookie
+    response = await request_text(
+        "POST",
+        "https://starvell.com/api/chats/read",
+        headers=headers,
+        cookies=cookies,
+        timeout=20,
+        json={"chatId": str(chat_id)},
+    )
+    if not response.text.strip():
+        return {}
+    try:
+        data = json.loads(response.text)
+    except json.JSONDecodeError:
+        return {}
+    return ensure_success(data, "mark chat read") if isinstance(data, dict) else {}
 
 
 
