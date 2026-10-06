@@ -12,10 +12,11 @@ from api.auth import fetch_homepage_data
 from api.chats import fetch_chats
 from api.find_lots_user import find_user_lots
 from api.http_client import close_http_session
-from api.messages import fetch_chat_messages
+from api.messages import fetch_chat_messages, fetch_chat_messages_page
 from api.offer_details import fetch_offer_detail, offer_context
-from api.orders import fetch_sells_all
+from api.orders import fetch_seller_orders, fetch_sells_all
 from api.response import page_props
+from tg_bot_exfa import realtime
 
 
 async def _measure(name: str, operation: Callable[[], Awaitable[Any]]) -> tuple[Any, dict[str, Any]]:
@@ -90,9 +91,34 @@ async def main() -> int:
                 ),
             )
             checks.append(result | {"count": len(messages or [])})
+            page, result = await _measure(
+                "messages_list_v2",
+                lambda: fetch_chat_messages_page(session, chat_id, limit=10),
+            )
+            checks.append(
+                result
+                | {
+                    "count": len((page or {}).get("items") or []),
+                    "has_more_before": bool((page or {}).get("has_more_before")),
+                }
+            )
 
         orders, result = await _measure("orders", lambda: fetch_sells_all(session, max_pages=3))
         checks.append(result | {"count": len(orders or [])})
+        listed, result = await _measure("orders_list", lambda: fetch_seller_orders(session, limit=5))
+        sample = (listed or [{}])[0] if listed else {}
+        checks.append(
+            result
+            | {
+                "count": len(listed or []),
+                "fields": sorted(key for key in sample if key in {"createdAt", "sortAt", "quantity", "user", "offerDetails"}),
+            }
+        )
+
+        socket, result = await _measure("realtime", lambda: realtime.probe(session))
+        accepted = (socket or {}).get("connected") or []
+        result["ok"] = result["ok"] and len(accepted) == len(realtime.NAMESPACES)
+        checks.append(result | {"namespaces": accepted, "rejected": (socket or {}).get("rejected") or []})
 
         lot_items = (lots or {}).get("lots") or []
         if lot_items:
