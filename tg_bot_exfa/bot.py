@@ -1,10 +1,10 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand
 from aiogram.client.default import DefaultBotProperties
 
 import tg_bot_exfa.app as app
+from tg_bot_exfa.commands import sync_bot_commands
 from tg_bot_exfa.config import hash_password, load_config, save_config, update_config_values
 from tg_bot_exfa.storage.db import Database
 from tg_bot_exfa.handlers.start import router as start_router
@@ -17,7 +17,8 @@ from api.http_client import close_http_session
 from tg_bot_exfa.logger import setup_logging
 from tg_bot_exfa.handlers.logs import router as logs_router
 from tg_bot_exfa.plugins import PluginManager, PluginContext
-from tg_bot_exfa.paths import DATABASE_PATH, PLUGINS_PATH, PLUGIN_STATE_PATH
+from tg_bot_exfa.instance_lock import InstanceLock, InstanceLockError
+from tg_bot_exfa.paths import DATABASE_PATH, INSTANCE_LOCK_PATH, PLUGINS_PATH, PLUGIN_STATE_PATH
 from tg_bot_exfa.storage.fsm import SQLiteStorage
 
 
@@ -78,24 +79,9 @@ async def run_bot() -> None:
     except Exception:
         pass
     try:
-        base_cmds = [
-            BotCommand(command="start", description="Запуск"),
-            BotCommand(command="restart", description="Перезапуск"),
-            BotCommand(command="update", description="Обновление"),
-            BotCommand(command="logs", description="Архив логов"),
-        ]
-        plugin_cmds: list[BotCommand] = []
-        seen = {c.command for c in base_cmds}
-        for name, meta in pm.commands.items():
-            cmd = str(name or "").strip().lower()
-            if not cmd or cmd in seen:
-                continue
-            desc = str(meta.get("description") or "").strip()[:256]
-            plugin_cmds.append(BotCommand(command=cmd, description=desc or "Plugin"))
-            seen.add(cmd)
-        await bot.set_my_commands(base_cmds + plugin_cmds)
-    except Exception:
-        pass
+        await sync_bot_commands(bot, pm)
+    except Exception as e:
+        log.warning("Failed to set bot commands: %s", e)
     try:
         full_text = (
 
@@ -129,12 +115,12 @@ async def run_bot() -> None:
         new_name = f"COXERHUB STARVELL | {profile_name}"
         if len(new_name) > 64:
             new_name = new_name[:64]
-        await bot.set_my_name(name=new_name)
-        try:
-            name_info = await bot.get_my_name()
-            log.info("Bot name set to: %r", getattr(name_info, "name", None))
-        except Exception as e:
-            log.warning("Unable to read back bot name: %s", e)
+        current = getattr(await bot.get_my_name(), "name", None)
+        if current != new_name:
+            await bot.set_my_name(name=new_name)
+            log.info("Bot name set to: %r", new_name)
+        else:
+            log.info("Bot name unchanged: %r", current)
     except Exception as e:
         log.warning("Failed to set bot name: %s", e)
     dp.include_router(start_router)
@@ -151,27 +137,9 @@ async def run_bot() -> None:
         session_cookie_init = (osnova_cfg or {}).get("SESSION_COOKIE", "")
         ctx_init = PluginContext(session_cookie=session_cookie_init, db=db, config=osnova_cfg or {})
         await pm.dispatch_init(ctx_init)
-        try:
-            base_cmds = [
-                BotCommand(command="start", description="Запуск"),
-                BotCommand(command="restart", description="Перезапуск"),
-                BotCommand(command="update", description="Обновление"),
-                BotCommand(command="logs", description="Архив логов"),
-            ]
-            plugin_cmds: list[BotCommand] = []
-            seen = {c.command for c in base_cmds}
-            for name, meta in pm.commands.items():
-                cmd = str(name or "").strip().lower()
-                if not cmd or cmd in seen:
-                    continue
-                desc = str(meta.get("description") or "").strip()[:256]
-                plugin_cmds.append(BotCommand(command=cmd, description=desc or "Plugin"))
-                seen.add(cmd)
-            await bot.set_my_commands(base_cmds + plugin_cmds)
-        except Exception:
-            pass
-    except Exception:
-        pass
+        await sync_bot_commands(bot, pm)
+    except Exception as e:
+        log.warning("Plugin init or command sync failed: %s", e)
     mt = asyncio.create_task(start_monitor())
     app.app_context.monitor_task = mt
     log.info("Polling started")
@@ -186,7 +154,16 @@ async def run_bot() -> None:
 
 
 def main() -> None:
-    asyncio.run(run_bot())
+    lock = InstanceLock(INSTANCE_LOCK_PATH)
+    try:
+        lock.acquire()
+    except InstanceLockError as exc:
+        print(f"Bot is already running: {exc}")
+        raise SystemExit(1)
+    try:
+        asyncio.run(run_bot())
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

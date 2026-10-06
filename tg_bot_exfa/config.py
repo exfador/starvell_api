@@ -43,7 +43,6 @@ class BotConfig:
 
 
 def md5_hex(text: str) -> str:
-    """Legacy hash retained only for reading old configurations."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
@@ -142,9 +141,9 @@ def load_config() -> BotConfig:
         if plain:
             password_md5 = hash_password(plain)
     default_language = data.get("DEFAULT_LANGUAGE", "ru")
-    author_username = data.get("AUTHOR_USERNAME") or os.getenv("AUTHOR_USERNAME") or "@exfador"
-    channel_url = data.get("CHANNEL_URL") or os.getenv("CHANNEL_URL") or "https://t.me/starvellapi"
-    chat_url = data.get("CHAT_URL") or os.getenv("CHAT_URL") or "https://t.me/community_starvell"
+    author_username = os.getenv("AUTHOR_USERNAME") or data.get("AUTHOR_USERNAME") or "@exfador"
+    channel_url = os.getenv("CHANNEL_URL") or data.get("CHANNEL_URL") or "https://t.me/starvellapi"
+    chat_url = os.getenv("CHAT_URL") or data.get("CHAT_URL") or "https://t.me/community_starvell"
     debug = bool(data.get("DEBUG", True))
     watermark_on = bool(data.get("WATERMARK_ON", True))
     watermark_text = str(data.get("WATERMARK_TEXT") or "[CXH BOT]")

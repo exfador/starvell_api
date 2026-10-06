@@ -32,12 +32,6 @@ def render_template(
     *,
     now: datetime | None = None,
 ) -> str:
-    """Render only explicitly named placeholders without evaluating expressions.
-
-    Missing and unknown placeholders are deliberately preserved so a typo is visible
-    to the operator instead of silently deleting part of a customer message.
-    """
-
     source = str(template or "")
     available: dict[str, Any] = _clock_values(now or datetime.now())
     if values:

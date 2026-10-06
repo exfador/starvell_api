@@ -8,8 +8,6 @@ import tg_bot_exfa.app as app
 
 
 class AuthorizedPrivateMiddleware(BaseMiddleware):
-    """Reject privileged Telegram events outside an authorized private chat."""
-
     async def __call__(
         self,
         handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],

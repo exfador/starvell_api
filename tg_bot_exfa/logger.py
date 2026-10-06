@@ -1,8 +1,69 @@
+import json
 import logging
 import os
+import re
 import sys
+import time
 from datetime import datetime
-from tg_bot_exfa.paths import LOGS_PATH
+from tg_bot_exfa.paths import CONFIG_PATH, LOGS_PATH
+
+_TELEGRAM_TOKEN = re.compile(r"(?<!\d)\d{6,12}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])")
+_SECRET_KEYS = ("BOT_TOKEN", "SESSION_COOKIE", "BOT_PASSWORD")
+_MIN_SECRET_LENGTH = 8
+_SECRETS_TTL_SECONDS = 5.0
+_secrets_cache: tuple[float, list[str]] = (0.0, [])
+
+
+def _secret_parts(value: str) -> list[str]:
+    parts = [value]
+    for item in value.split(";"):
+        parts.append(item.split("=", 1)[-1].strip())
+    return [part for part in parts if len(part) >= _MIN_SECRET_LENGTH]
+
+
+def configured_secrets() -> list[str]:
+    global _secrets_cache
+    loaded_at, cached = _secrets_cache
+    if time.monotonic() - loaded_at < _SECRETS_TTL_SECONDS:
+        return cached
+    values = [os.getenv(key, "") for key in _SECRET_KEYS]
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as source:
+            data = json.load(source) or {}
+        if isinstance(data, dict):
+            values.extend(str(data.get(key) or "") for key in _SECRET_KEYS)
+    except (OSError, ValueError):
+        pass
+    secrets = sorted({part for value in values if value for part in _secret_parts(value.strip())}, key=len, reverse=True)
+    _secrets_cache = (time.monotonic(), secrets)
+    return secrets
+
+
+def mask_secrets(text: str, secrets: list[str]) -> str:
+    masked = _TELEGRAM_TOKEN.sub("<bot-token>", text)
+    for secret in secrets:
+        if secret in masked:
+            masked = masked.replace(secret, "<secret>")
+    return masked
+
+
+class SecretMaskingFilter(logging.Filter):
+    def __init__(self, secrets_provider=configured_secrets):
+        super().__init__()
+        self._secrets_provider = secrets_provider
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            secrets = self._secrets_provider()
+            message = record.getMessage()
+            masked = mask_secrets(message, secrets)
+            if masked != message:
+                record.msg, record.args = masked, None
+            if record.exc_info and not record.exc_text:
+                record.exc_text = mask_secrets(logging.Formatter().formatException(record.exc_info), secrets)
+        except Exception:
+            pass
+        return True
 
 
 class _ColorFormatter(logging.Formatter):
@@ -23,10 +84,12 @@ class _ColorFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         if self.enable_color:
+            record = logging.makeLogRecord(record.__dict__)
             color = self._color_for(record)
+            pretty = record.name.startswith("exfador.pretty")
             record.levelname = f"{color}{record.levelname}{self.COLORS['RESET']}"
             record.name = f"{self.COLORS['BLUE']}{record.name}{self.COLORS['RESET']}"
-            if record.name.startswith("exfador.pretty"):
+            if pretty:
                 record.msg = f"{self.COLORS['MAGENTA']}{record.msg}{self.COLORS['RESET']}"
         return super().format(record)
 
@@ -57,8 +120,10 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     logger.handlers.clear()
     logger.setLevel(logging.DEBUG)
 
+    masking = SecretMaskingFilter()
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
+    console_handler.addFilter(masking)
     formatter = _ColorFormatter(fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%H:%M:%S")
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
@@ -163,6 +228,7 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 
         file_handler = _DateFolderFileHandler(logs_root)
         file_handler.setLevel(logging.DEBUG)
+        file_handler.addFilter(masking)
         file_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)

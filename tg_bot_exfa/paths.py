@@ -16,3 +16,4 @@ PLUGIN_STATE_PATH = (
     else (PROJECT_ROOT / "storage" / "plugins" / "state.json")
 )
 LOGS_PATH = (DATA_ROOT / "logs") if DATA_ROOT else (PROJECT_ROOT / "logs")
+INSTANCE_LOCK_PATH = (DATA_ROOT or PROJECT_ROOT) / "bot.lock"

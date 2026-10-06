@@ -1,9 +1,12 @@
 import html
+import logging
+import re
 import aiosqlite
 from collections.abc import Awaitable, Callable
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, LinkPreviewOptions
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, LinkPreviewOptions
 
 from tg_bot_exfa.config import load_config
 import tg_bot_exfa.app as app
@@ -61,6 +64,42 @@ def _fmt_money(value) -> str:
 
 tr = Translations()
 kb = Keyboards()
+log = logging.getLogger("exfador.notify")
+
+TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
+BUMP_SUMMARY_LIMIT = 30
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def _plain_text(text: str) -> str:
+    return html.unescape(_HTML_TAG.sub("", text or ""))
+
+
+async def _send_text(bot: Bot, chat_id: int, text: str, reply_markup=None, *, filename: str = "message.txt", **kwargs):
+    plain = _plain_text(text)
+    if len(plain) <= TELEGRAM_TEXT_LIMIT:
+        return await bot.send_message(chat_id, text, reply_markup=reply_markup, **kwargs)
+    caption = plain if len(plain) < TELEGRAM_CAPTION_LIMIT else plain[: TELEGRAM_CAPTION_LIMIT - 1].rstrip() + "…"
+    document = BufferedInputFile(plain.encode("utf-8"), filename=filename)
+    return await bot.send_document(chat_id, document, caption=caption, parse_mode=None, reply_markup=reply_markup)
+
+
+def _is_permanent_delivery_error(exc: Exception) -> bool:
+    if isinstance(exc, TelegramForbiddenError):
+        return True
+    return isinstance(exc, TelegramBadRequest) and "chat not found" in str(exc).lower()
+
+
+async def _send_each(kind: str, recipients: list[tuple[int, str]], send_one: Callable[[int, str], Awaitable[None]]) -> int:
+    delivered = 0
+    for user_id, language in recipients:
+        try:
+            await send_one(user_id, language)
+            delivered += 1
+        except Exception as exc:
+            log.warning("notification_failed kind=%s user_id=%s error=%s", kind, user_id, exc)
+    return delivered
 
 
 def _notification_bot(cfg) -> tuple[Bot, bool]:
@@ -86,6 +125,8 @@ async def _deliver_notification(
     send_one: Callable[[int, str], Awaitable[None]],
 ) -> int:
     if not recipients:
+        if await _recipients_authorized():
+            return 0
         raise NotificationDeliveryError("notification has no recipients")
     database = getattr(app.app_context, "db", None) if app.app_context else None
     delivered = 0
@@ -96,11 +137,20 @@ async def _deliver_notification(
             continue
         try:
             await send_one(user_id, language)
-            if database:
-                await database.mark_notification_receipt(event_kind, event_id, user_id)
-            delivered += 1
         except Exception as exc:
-            failures.append(f"{user_id}: {exc}")
+            if not _is_permanent_delivery_error(exc):
+                failures.append(f"{user_id}: {exc}")
+                continue
+            log.warning(
+                "notification_recipient_unreachable kind=%s user_id=%s error=%s",
+                event_kind,
+                user_id,
+                exc,
+            )
+        else:
+            delivered += 1
+        if database:
+            await database.mark_notification_receipt(event_kind, event_id, user_id)
     if failures:
         raise NotificationDeliveryError("; ".join(failures))
     return delivered
@@ -194,7 +244,8 @@ async def send_auth_notification(success: bool, user: dict | None = None) -> Non
     bot, owns_bot = _notification_bot(cfg)
     try:
         recipients = await _recipients("notify_auth")
-        for chat_id, lang in recipients:
+
+        async def send_one(chat_id: int, lang: str) -> None:
             rows: list[list[InlineKeyboardButton]] = []
             if success and user and user.get("id"):
                 profile_url = f"https://starvell.com/users/{user.get('id')}"
@@ -224,6 +275,8 @@ async def send_auth_notification(success: bool, user: dict | None = None) -> Non
                 reply_markup=markup,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
+
+        await _send_each("auth", recipients, send_one)
     finally:
         await _close_owned_bot(bot, owns_bot)
 
@@ -237,14 +290,38 @@ async def send_bump_notification(lot: dict, success: bool) -> None:
         recipients = await _recipients("notify_bump")
         title = str(lot.get("title") or lot.get("url") or "Lot")
         url = str(lot.get("url") or "")
-        markup = None
-        for _, lang in recipients[:1]:
+
+        async def send_one(chat_id: int, lang: str) -> None:
             btn_text = tr.t(lang, "btn_open_link")
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, url=url)]]) if url else None
-            break
-        for chat_id, lang in recipients:
-            text = _text_bump(title, success, lang)
-            await bot.send_message(chat_id, text, reply_markup=markup)
+            await bot.send_message(chat_id, _text_bump(title, success, lang), reply_markup=markup)
+
+        await _send_each("bump", recipients, send_one)
+    finally:
+        await _close_owned_bot(bot, owns_bot)
+
+
+async def send_bump_summary(lots: list[dict]) -> int:
+    cfg = load_config()
+    if not cfg.token or not lots:
+        return 0
+    bot, owns_bot = _notification_bot(cfg)
+    try:
+        recipients = await _recipients("notify_bump")
+        lines: list[str] = []
+        for lot in lots[:BUMP_SUMMARY_LIMIT]:
+            title = html.escape(str(lot.get("title") or lot.get("id") or "Lot"))
+            url = str(lot.get("url") or "")
+            lines.append(f'• <a href="{html.escape(url, quote=True)}">{title}</a>' if url else f"• {title}")
+
+        async def send_one(chat_id: int, lang: str) -> None:
+            body = list(lines)
+            if len(lots) > BUMP_SUMMARY_LIMIT:
+                body.append(tr.t(lang, "bump_summary_more", count=len(lots) - BUMP_SUMMARY_LIMIT))
+            text = tr.t(lang, "bump_summary", count=len(lots), lots="\n".join(body))
+            await _send_text(bot, chat_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+        return await _send_each("bump", recipients, send_one)
     finally:
         await _close_owned_bot(bot, owns_bot)
 
@@ -285,6 +362,7 @@ async def send_order_notification(
     order: dict,
     ad: tuple[str, str] | None = None,
     event_id: str | None = None,
+    ad_warning: tuple[str, str, dict] | None = None,
 ) -> int:
     cfg = load_config()
     if not cfg.token:
@@ -361,10 +439,19 @@ async def send_order_notification(
                     name, value = (html.escape(str(ad[0])), html.escape(str(ad[1])))
                     addon = tr.t(lang, "ad_drop_append", name=name, value=value)
                     text = f"{text}\n\n{addon}"
+                if ad_warning is not None:
+                    warning_name, reason_key, reason_params = ad_warning
+                    reason = tr.t(
+                        lang,
+                        reason_key,
+                        **{key: html.escape(str(value)) for key, value in reason_params.items()},
+                    )
+                    warning = tr.t(lang, "ad_drop_warning", name=html.escape(str(warning_name)), reason=reason)
+                    text = f"{text}\n\n{warning}"
                 order_text_by_lang[lang] = text
             msg = order_text_by_lang[lang]
             markup = kb.order_notification(lambda k: tr.t(lang, k), order_id, url).as_markup()
-            await bot.send_message(chat_id_, msg, reply_markup=markup)
+            await _send_text(bot, chat_id_, msg, reply_markup=markup, filename=f"order-{order_id}.txt")
         return await _deliver_notification(
             "order_created",
             str(event_id or order_id),
@@ -430,7 +517,8 @@ async def send_autodelivery_item(order: dict, product_name: str, value: str) -> 
             return
         order_id = order.get("id")
         url = f"https://starvell.com/order/{order_id}"
-        for chat_id_, lang in recipients:
+
+        async def send_one(chat_id_: int, lang: str) -> None:
             text = tr.t(
                 lang,
                 "ad_drop_text",
@@ -439,43 +527,36 @@ async def send_autodelivery_item(order: dict, product_name: str, value: str) -> 
                 order_id=html.escape(str(order_id)),
             )
             markup = kb.order_notification_view(lambda k: tr.t(lang, k), order_id, url).as_markup()
-            await bot.send_message(chat_id_, text, reply_markup=markup)
+            await _send_text(bot, chat_id_, text, reply_markup=markup, filename=f"order-{order_id}.txt")
+
+        await _send_each("autodelivery", recipients, send_one)
+    finally:
+        await _close_owned_bot(bot, owns_bot)
+
+
+async def _send_security_event(key: str, user_id: int, username: str | None) -> None:
+    cfg = load_config()
+    if not cfg.token:
+        return
+    bot, owns_bot = _notification_bot(cfg)
+    try:
+        recipients = await _recipients_authorized()
+        uname = html.escape(str(username or "-"))
+
+        async def send_one(chat_id_: int, lang: str) -> None:
+            await bot.send_message(chat_id_, tr.t(lang, key, id=user_id, username=uname))
+
+        await _send_each("security", recipients, send_one)
     finally:
         await _close_owned_bot(bot, owns_bot)
 
 
 async def send_security_auth_blocked(user_id: int, username: str | None) -> None:
-    cfg = load_config()
-    if not cfg.token:
-        return
-    bot, owns_bot = _notification_bot(cfg)
-    try:
-        recipients = await _recipients_authorized()
-        if not recipients:
-            return
-        uname = html.escape(str(username or "-"))
-        for chat_id_, lang in recipients:
-            text = tr.t(lang, "security_auth_blocked", id=user_id, username=uname)
-            await bot.send_message(chat_id_, text)
-    finally:
-        await _close_owned_bot(bot, owns_bot)
+    await _send_security_event("security_auth_blocked", user_id, username)
 
 
 async def send_security_auth_success(user_id: int, username: str | None) -> None:
-    cfg = load_config()
-    if not cfg.token:
-        return
-    bot, owns_bot = _notification_bot(cfg)
-    try:
-        recipients = await _recipients_authorized()
-        if not recipients:
-            return
-        uname = html.escape(str(username or "-"))
-        for chat_id_, lang in recipients:
-            text = tr.t(lang, "security_auth_success", id=user_id, username=uname)
-            await bot.send_message(chat_id_, text)
-    finally:
-        await _close_owned_bot(bot, owns_bot)
+    await _send_security_event("security_auth_success", user_id, username)
 
 
 async def sync_digest_view(payload: dict, event_id: str | None = None) -> int:
@@ -521,7 +602,14 @@ async def sync_digest_view(payload: dict, event_id: str | None = None) -> int:
             if photo_url:
                 msg = await bot.send_photo(chat_id_, photo_url, caption=text or None, reply_markup=markup)
             else:
-                msg = await bot.send_message(chat_id_, text or "", reply_markup=markup, link_preview_options=LinkPreviewOptions(is_disabled=True))
+                msg = await _send_text(
+                    bot,
+                    chat_id_,
+                    text or "",
+                    reply_markup=markup,
+                    filename="announcement.txt",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
             if pin_flag:
                 try:
                     await bot.pin_chat_message(chat_id_, msg.message_id)
