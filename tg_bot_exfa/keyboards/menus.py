@@ -155,10 +155,11 @@ class Keyboards:
             b.button(text=t("btn_open_link"), url=url)
         b.button(text=t("btn_send_message"), callback_data=f"chat:reply:{chat_id}")
         b.button(text=t("btn_templates_open"), callback_data=f"chat:templates:{chat_id}")
+        b.button(text=t("btn_mark_read"), callback_data=f"chat:read:{chat_id}")
         if url:
-            b.adjust(1, 2)
+            b.adjust(1, 2, 1)
         else:
-            b.adjust(2)
+            b.adjust(2, 1)
         return b
 
     def chat_reply_cancel(self, t, chat_id: str):
