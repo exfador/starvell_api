@@ -4,6 +4,7 @@ import logging
 import math
 import io
 import re
+import time
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -12,8 +13,9 @@ from aiogram.exceptions import TelegramBadRequest
 
 import tg_bot_exfa.app as app
 from api.auth import fetch_homepage_data
+from api.chats import mark_chat_read
 from api.find_lots_user import find_user_lots
-from api.orders import refund_order, fetch_sells_all
+from api.orders import refund_order, fetch_sells_all, fetch_seller_orders_all
 from api.send_message import send_chat_message, send_chat_image
 from tg_bot_exfa.exf_langue.strings import Translations
 from tg_bot_exfa.keyboards.menus import Keyboards
@@ -28,6 +30,7 @@ from tg_bot_exfa.middleware import protect_router
 from tg_bot_exfa.paths import CONFIG_PATH, PROJECT_ROOT
 from tg_bot_exfa.runtime import schedule_restart
 from tg_bot_exfa.template_renderer import render_template
+from tg_bot_exfa.versioning import fetch_latest_tag
 from tg_bot_exfa.updater import (
     apply_update_tree,
     install_requirements_if_needed,
@@ -50,6 +53,29 @@ MAX_AUTODELIVERY_LINES = 20_000
 MAX_AUTODELIVERY_ITEMS = 100_000
 MAX_AUTODELIVERY_REPEAT = 10_000
 MAX_CHAT_IMAGE_BYTES = 10_000_000
+STATS_CACHE_SECONDS = 300
+
+_stats_lock = asyncio.Lock()
+_stats_cache: tuple[str, float, list[dict]] | None = None
+_refunds_in_flight: set[str] = set()
+
+
+async def _sells_for_stats(session_cookie: str) -> list[dict]:
+    global _stats_cache
+    async with _stats_lock:
+        if _stats_cache is not None:
+            cached_session, loaded_at, orders = _stats_cache
+            if cached_session == session_cookie and time.monotonic() - loaded_at < STATS_CACHE_SECONDS:
+                return orders
+        try:
+            orders = await fetch_seller_orders_all(session_cookie)
+            if orders and not any(order.get("createdAt") or order.get("sortAt") for order in orders):
+                raise ValueError("orders have no dates")
+        except Exception as exc:
+            log.warning("stats_orders_list_failed error=%s; falling back to sells pages", exc)
+            orders = await fetch_sells_all(session_cookie)
+        _stats_cache = (session_cookie, time.monotonic(), orders)
+        return orders
 
 
 def _parse_autodelivery_values(raw: str) -> list[str]:
@@ -139,6 +165,13 @@ async def _safe_edit_callback_message(message: Message, text: str, reply_markup)
     await message.edit_caption(caption=text or " ", reply_markup=reply_markup)
 
 
+async def _mark_read_quietly(session_cookie: str, chat_id: str, my_games_cookie: str | None = None) -> None:
+    try:
+        await mark_chat_read(session_cookie, chat_id, my_games_cookie=my_games_cookie)
+    except Exception as exc:
+        log.warning("chat_mark_read_failed chat_id=%s error=%s", chat_id, exc)
+
+
 async def _send_reply_from_state(
     bot,
     state: FSMContext,
@@ -196,6 +229,7 @@ async def _send_reply_from_state(
         await send_chat_message(session_cookie, chat_id, content, my_games_cookie=my_games_cookie)
     except Exception as exc:
         return False, str(exc), chat_id
+    await _mark_read_quietly(session_cookie, chat_id, my_games_cookie)
     notification_chat_id = data.get("notification_chat_id") or default_chat_id
     notification_message_id = data.get("notification_message_id") or default_message_id
     original_kind = data.get("original_kind") or "text"
@@ -317,6 +351,7 @@ async def _send_reply_image_from_state(
         )
     except Exception as exc:
         return False, str(exc), chat_id
+    await _mark_read_quietly(session_cookie, chat_id, my_games_cookie)
     caption_error = None
     if caption:
         try:
@@ -445,7 +480,7 @@ async def open_stats(callback: CallbackQuery):
             except Exception:
                 pass
             return
-        orders = await fetch_sells_all(session_cookie)
+        orders = await _sells_for_stats(session_cookie)
     except Exception as exc:
         try:
             await callback.message.edit_text(tr.t(lang, "reply_failed", error=str(exc)))
@@ -476,7 +511,7 @@ async def open_stats(callback: CallbackQuery):
 
     for order in orders:
         status = (order or {}).get("status") or ""
-        created_at = parse_dt((order or {}).get("createdAt"))
+        created_at = parse_dt((order or {}).get("createdAt") or (order or {}).get("sortAt"))
         price_raw = (order or {}).get("totalPrice") or (order or {}).get("basePrice") or 0
         try:
             price_val = int(price_raw)
@@ -1677,21 +1712,8 @@ async def open_info(callback: CallbackQuery):
     size_bytes = _calc_project_size_bytes(root)
     size_mb = max(0.0, size_bytes / (1024 * 1024))
 
-    latest = "—"
     try:
-        import requests 
-        r = await asyncio.to_thread(
-            requests.get,
-            "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
-            headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
-            timeout=5,
-        )
-        if r.status_code == 200:
-            for it in (r.json() or []):
-                name = str((it or {}).get("name") or "").strip()
-                if name and name.lower() != "api":
-                    latest = name
-                    break
+        latest = await asyncio.to_thread(fetch_latest_tag, 5) or "—"
     except Exception:
         latest = "—"
 
@@ -1908,12 +1930,18 @@ async def confirm_order_refund(callback: CallbackQuery, state: FSMContext):
     if not session_cookie:
         await callback.answer(tr.t(lang, "order_refund_failed", error="SESSION_COOKIE missing"), show_alert=True)
         return
+    if order_id in _refunds_in_flight:
+        await callback.answer(tr.t(lang, "order_refund_failed", error="refund is already in progress"), show_alert=True)
+        return
+    _refunds_in_flight.add(order_id)
     try:
         await refund_order(session_cookie, order_id, sid_cookie)
     except Exception as exc:
         log.warning("order_refund_request_failed user_id=%s order_id=%s error=%s", callback.from_user.id, order_id, exc)
         await callback.answer(tr.t(lang, "order_refund_failed", error=str(exc)), show_alert=True)
         return
+    finally:
+        _refunds_in_flight.discard(order_id)
     order_text = data.get("order_original_text") or ""
     order_lang = data.get("order_original_lang") or lang
     order_url = data.get("order_url") or f"https://starvell.com/order/{order_id}"
@@ -2006,6 +2034,26 @@ async def start_chat_reply(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
     log.debug(f"chat_reply_start user_id={callback.from_user.id} chat_id={chat_id}")
+
+
+@router.callback_query(F.data.startswith("chat:read:"))
+async def mark_chat_read_from_notification(callback: CallbackQuery):
+    db = app.app_context.db
+    cfg = app.app_context.config
+    user = await db.get_user(callback.from_user.id)
+    lang = await _lang_of(user, cfg)
+    chat_id = callback.data.split(":", 2)[2]
+    try:
+        session_cookie = load_osnova_config().get("SESSION_COOKIE", "")
+        if not session_cookie:
+            raise RuntimeError("SESSION_COOKIE missing")
+        await mark_chat_read(session_cookie, chat_id)
+    except Exception as exc:
+        log.warning("chat_mark_read_failed user_id=%s chat_id=%s error=%s", callback.from_user.id, chat_id, exc)
+        await callback.answer(tr.t(lang, "chat_mark_read_failed", error=str(exc)[:150]), show_alert=True)
+        return
+    await callback.answer(tr.t(lang, "chat_marked_read"))
+    log.info("chat_marked_read user_id=%s chat_id=%s", callback.from_user.id, chat_id)
 
 
 @router.callback_query(F.data.startswith("chat:templates:"))
@@ -2175,7 +2223,7 @@ async def handle_chat_reply_text(message: Message, state: FSMContext):
     cfg = app.app_context.config
     user = await db.get_user(message.from_user.id)
     lang = await _lang_of(user, cfg)
-    content = message.html_text if message.entities else message.text
+    content = message.text or ""
     default_chat_id = data.get("notification_chat_id") or message.chat.id
     default_message_id = data.get("notification_message_id")
     success, error, sent_chat_id = await _send_reply_from_state(
@@ -2232,12 +2280,7 @@ async def handle_chat_reply_photo(message: Message, state: FSMContext):
     if buf.tell() > MAX_CHAT_IMAGE_BYTES:
         await message.answer(tr.t(lang, "reply_failed", error="image is too large"))
         return
-    caption = None
-    if message.caption:
-        if message.caption_entities:
-            caption = getattr(message, "html_caption", None) or message.caption
-        else:
-            caption = message.caption
+    caption = message.caption or None
     default_chat_id = data.get("notification_chat_id") or message.chat.id
     default_message_id = data.get("notification_message_id")
     success, error, sent_chat_id = await _send_reply_image_from_state(
@@ -2294,12 +2337,7 @@ async def handle_chat_reply_document(message: Message, state: FSMContext):
     if buf.tell() > MAX_CHAT_IMAGE_BYTES:
         await message.answer(tr.t(lang, "reply_failed", error="image is too large"))
         return
-    caption = None
-    if message.caption:
-        if message.caption_entities:
-            caption = getattr(message, "html_caption", None) or message.caption
-        else:
-            caption = message.caption
+    caption = message.caption or None
     filename = str(getattr(doc, "file_name", "") or "").strip() or "image"
     default_chat_id = data.get("notification_chat_id") or message.chat.id
     default_message_id = data.get("notification_message_id")

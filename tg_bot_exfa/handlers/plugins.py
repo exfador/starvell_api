@@ -6,13 +6,14 @@ import html
 from pathlib import Path
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery, BotCommand, LinkPreviewOptions
+from aiogram.types import Message, CallbackQuery, LinkPreviewOptions
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import tg_bot_exfa.app as app
 from tg_bot_exfa.exf_langue.strings import Translations
 from tg_bot_exfa.keyboards.menus import Keyboards
 from tg_bot_exfa.states.plugins import PluginsFlow
+from tg_bot_exfa.commands import sync_bot_commands
 from tg_bot_exfa.plugins import PluginContext
 from tg_bot_exfa.middleware import protect_router
 from tg_bot_exfa.paths import PLUGINS_PATH
@@ -147,21 +148,7 @@ async def handle_plugin_upload(message: Message, state: FSMContext):
 		ctx = PluginContext(session_cookie=(cfg2 or {}).get("SESSION_COOKIE", ""), db=app.app_context.db, config=cfg2 or {})
 		await pm.dispatch_init(ctx)
 		try:
-			base_cmds = [
-				BotCommand(command="start", description="Запуск"),
-				BotCommand(command="restart", description="Перезапуск"),
-				BotCommand(command="update", description="Обновление"),
-			]
-			plugin_cmds: list[BotCommand] = []
-			seen = {c.command for c in base_cmds}
-			for name, meta_cmd in pm.commands.items():
-				cmd = str(name or "").strip().lower()
-				if not cmd or cmd in seen:
-					continue
-				desc = str(meta_cmd.get("description") or "").strip()[:256]
-				plugin_cmds.append(BotCommand(command=cmd, description=desc or "Plugin"))
-				seen.add(cmd)
-			await message.bot.set_my_commands(base_cmds + plugin_cmds)
+			await sync_bot_commands(message.bot, pm)
 		except Exception:
 			pass
 		data = await state.get_data()
@@ -305,21 +292,7 @@ async def plugin_toggle(callback: CallbackQuery, state: FSMContext):
 		pm.enable(uuid)
 		await callback.message.edit_text(tr.t(lang, "plugin_toggled_on"))
 	try:
-		base_cmds = [
-			BotCommand(command="start", description="Запуск"),
-			BotCommand(command="restart", description="Перезапуск"),
-			BotCommand(command="update", description="Обновление"),
-		]
-		plugin_cmds: list[BotCommand] = []
-		seen = {c.command for c in base_cmds}
-		for name, meta_cmd in pm.commands.items():
-			cmd = str(name or "").strip().lower()
-			if not cmd or cmd in seen:
-				continue
-			desc = str(meta_cmd.get("description") or "").strip()[:256]
-			plugin_cmds.append(BotCommand(command=cmd, description=desc or "Plugin"))
-			seen.add(cmd)
-		await callback.message.bot.set_my_commands(base_cmds + plugin_cmds)
+		await sync_bot_commands(callback.message.bot, pm)
 	except Exception:
 		pass
 	await asyncio.sleep(1)
@@ -335,21 +308,7 @@ async def plugin_remove(callback: CallbackQuery, state: FSMContext):
 	pm = app.app_context.plugin_manager
 	pm.remove(uuid)
 	try:
-		base_cmds = [
-			BotCommand(command="start", description="Запуск"),
-			BotCommand(command="restart", description="Перезапуск"),
-			BotCommand(command="update", description="Обновление"),
-		]
-		plugin_cmds: list[BotCommand] = []
-		seen = {c.command for c in base_cmds}
-		for name, meta_cmd in pm.commands.items():
-			cmd = str(name or "").strip().lower()
-			if not cmd or cmd in seen:
-				continue
-			desc = str(meta_cmd.get("description") or "").strip()[:256]
-			plugin_cmds.append(BotCommand(command=cmd, description=desc or "Plugin"))
-			seen.add(cmd)
-		await callback.message.bot.set_my_commands(base_cmds + plugin_cmds)
+		await sync_bot_commands(callback.message.bot, pm)
 	except Exception:
 		pass
 	await callback.message.edit_text(tr.t(lang, "plugin_removed"))

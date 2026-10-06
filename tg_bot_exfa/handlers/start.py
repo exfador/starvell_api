@@ -4,6 +4,7 @@ from aiogram import Router, F
 import logging
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import Message
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -14,7 +15,9 @@ from tg_bot_exfa.states.auth import StartFlow
 from tg_bot_exfa.config import hash_password, password_needs_rehash, save_config, verify_password
 from tg_bot_exfa.notify import send_security_auth_success, send_security_auth_blocked
 from tg_bot_exfa.middleware import PrivateChatMiddleware
+from tg_bot_exfa.paths import LOGS_PATH
 from tg_bot_exfa.runtime import schedule_restart
+from tg_bot_exfa.versioning import fetch_latest_tag, is_newer
 
 
 router = Router()
@@ -28,6 +31,13 @@ _password_work = asyncio.Semaphore(2)
 async def _run_password_work(func, *args):
     async with _password_work:
         return await asyncio.to_thread(func, *args)
+
+
+async def _reset_dialogs(state: FSMContext, user_ids: list[int]) -> None:
+    for user_id in user_ids:
+        key = StorageKey(bot_id=state.key.bot_id, chat_id=user_id, user_id=user_id)
+        await state.storage.set_state(key, None)
+        await state.storage.set_data(key, {})
 
 
 @router.message(CommandStart())
@@ -118,6 +128,7 @@ async def on_password(message: Message, state: FSMContext):
     left = max(0, 5 - attempts)
     if attempts >= 5:
         await db.set_blocked_until(message.from_user.id, int(time.time()) + 24 * 3600)
+        await db.reset_failed(message.from_user.id)
         await message.bot.edit_message_text(
             tr.t(lang, "blocked_24h"),
             chat_id=message.chat.id,
@@ -151,9 +162,18 @@ async def on_change_password(message: Message, state: FSMContext):
         await message.delete()
     except Exception:
         pass
+    if not user.get("authorized"):
+        await state.clear()
+        await message.answer("Доступ запрещён. Используйте /start в личном чате.")
+        log.warning(f"password_change_rejected_unauthorized user_id={message.from_user.id}")
+        return
     cfg.password_md5 = await _run_password_work(hash_password, password)
     save_config(cfg)
-    await db.revoke_authorizations(except_user_id=message.from_user.id)
+    revoked = await db.revoke_authorized_users(except_user_id=message.from_user.id)
+    try:
+        await _reset_dialogs(state, revoked)
+    except Exception as exc:
+        log.warning(f"revoked_dialogs_reset_failed count={len(revoked)} error={exc}")
     await state.clear()
     await message.bot.edit_message_text(
         tr.t(lang, "password_changed"),
@@ -166,7 +186,6 @@ async def on_change_password(message: Message, state: FSMContext):
 
 @router.message(Command("update"))
 async def cmd_update(message: Message):
-    import requests
     from version import VERSION
     db = app.app_context.db
     cfg = app.app_context.config
@@ -174,25 +193,13 @@ async def cmd_update(message: Message):
     if not user.get("authorized"):
         return
     lang = user.get("language") or cfg.default_language
-    latest = None
     try:
-        r = await asyncio.to_thread(
-            requests.get,
-            "https://api.github.com/repos/exfador/starvell_api/tags?page=1",
-            headers={"accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
-            timeout=10,
-        )
-        if r.status_code == 200:
-            for it in (r.json() or []):
-                name = str((it or {}).get("name") or "").strip()
-                if name and name.lower() != "api":
-                    latest = name
-                    break
+        latest = await asyncio.to_thread(fetch_latest_tag)
     except Exception:
         latest = None
     lines = [tr.t(lang, "update_title"), tr.t(lang, "update_current", current=VERSION)]
     markup = None
-    if latest and latest != VERSION:
+    if latest and is_newer(latest, VERSION):
         lines.append(tr.t(lang, "update_available", latest=latest))
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=tr.t(lang, "btn_update"), callback_data=f"update:install:{latest}")]])
     else:
@@ -214,8 +221,7 @@ async def cmd_logs(message: Message):
     if not user.get("authorized"):
         return
 
-    root = Path(__file__).resolve().parents[2]
-    logs_dir = root / "logs"
+    logs_dir = LOGS_PATH
 
     if not logs_dir.exists():
         await message.answer("📂 Папка логов не найдена")
